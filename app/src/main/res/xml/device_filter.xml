@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Realtek Semiconductor Corp. RTL8152 / RTL8153 -->
+    <usb-device vendor-id="3034" product-id="33106" /> <!-- 0x0bda:0x8152 -->
+    <usb-device vendor-id="3034" product-id="33107" /> <!-- 0x0bda:0x8153 -->
+    <usb-device vendor-id="3034" product-id="33109" /> <!-- 0x0bda:0x8155 -->
+    <usb-device vendor-id="3034" product-id="33110" /> <!-- 0x0bda:0x8156 -->
+    <!-- ASIX Electronics Corp. AX88179 / AX88772 -->
+    <usb-device vendor-id="2965" product-id="6032" /> <!-- 0x0b95:0x1790 -->
+    <usb-device vendor-id="2965" product-id="30496" /> <!-- 0x0b95:0x7720 -->
+    <usb-device vendor-id="2965" product-id="7000" /> <!-- 0x0b95:0x1b58 -->
+    <!-- CDC-ECM / CDC-NCM Ethernet class -->
+    <usb-device class="2" subclass="6" />
+    <usb-device class="2" subclass="13" />
+    <!-- Catch-all for vendor specific USB NICs -->
+    <usb-device class="255" />
+</resources>

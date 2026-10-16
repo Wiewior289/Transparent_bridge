@@ -1,0 +1,6 @@
+{
+  "name": "PlcBridge",
+  "description": "Transparentny most przemysłowy VPN USB-Ethernet dla sterowników PLC i paneli HMI (GP-Pro EX / Pro-face, FTPS, TLS 1.3) na stock ROM bez roota.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">PlcBridge</string>
+    <string name="nav_dashboard">Dashboard</string>
+    <string name="nav_usb">USB Ethernet</string>
+    <string name="nav_vpn">Tailscale VPN</string>
+    <string name="nav_routes">Routing &amp; ALG</string>
+    <string name="nav_console">Live Console</string>
+    <string name="nav_settings">Settings</string>
+</resources>
