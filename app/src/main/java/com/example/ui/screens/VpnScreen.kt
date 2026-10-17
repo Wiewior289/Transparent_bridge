@@ -3,6 +3,8 @@ package com.example.ui.screens
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -70,6 +72,7 @@ import com.example.ui.theme.TextSecondary
 fun VpnScreen(viewModel: PlcBridgeViewModel) {
     val context = LocalContext.current
     val tailscaleConfig by viewModel.tailscaleConfig.collectAsState()
+    val tailscaleLogs by viewModel.tailscaleLogs.collectAsState()
 
     var nodeNameInput by remember(tailscaleConfig.nodeName) { mutableStateOf(tailscaleConfig.nodeName) }
     var routesInput by remember(tailscaleConfig.advertisedRoutes) { mutableStateOf(tailscaleConfig.advertisedRoutes) }
@@ -189,25 +192,97 @@ fun VpnScreen(viewModel: PlcBridgeViewModel) {
 
                 Spacer(modifier = Modifier.height(14.dp))
 
-                Button(
-                    onClick = {
-                        viewModel.updateTailscaleConfig(
-                            tailscaleConfig.copy(
-                                nodeName = nodeNameInput,
-                                advertisedRoutes = routesInput,
-                                authKey = authKeyInput
-                            )
-                        )
-                        Toast.makeText(context, "Tailscale settings updated", Toast.LENGTH_SHORT).show()
-                    },
+                Row(
                     modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = IndustrialCyan,
-                        contentColor = Color.Black
-                    ),
-                    shape = RoundedCornerShape(10.dp)
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Text("Apply Subnet Configuration", fontWeight = FontWeight.Bold)
+                    Button(
+                        onClick = {
+                            viewModel.connectTailscale(authKeyInput, nodeNameInput, routesInput)
+                            Toast.makeText(context, "Authenticating with Tailscale...", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.weight(1.2f),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = IndustrialCyan,
+                            contentColor = Color.Black
+                        ),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Text("Connect with Key", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            val browserIntent = Intent(Intent.ACTION_VIEW, Uri.parse("https://login.tailscale.com/admin/machines"))
+                            context.startActivity(browserIntent)
+                        },
+                        modifier = Modifier.weight(0.9f),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = IndustrialAmber)
+                    ) {
+                        Text("Admin Console", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+
+        // Live Tailscale Handshake Terminal
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+            border = androidx.compose.foundation.BorderStroke(1.dp, OutlineDark),
+            shape = RoundedCornerShape(16.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "TAILSCALE CONNECTION TERMINAL",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = IndustrialCyan,
+                        letterSpacing = 1.sp
+                    )
+
+                    Icon(
+                        imageVector = Icons.Default.Terminal,
+                        contentDescription = null,
+                        tint = IndustrialCyan,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(160.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(SurfaceElevated)
+                        .padding(10.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    if (tailscaleLogs.isEmpty()) {
+                        Text(
+                            text = "No connection logs yet.\nTap 'Connect with Key' to initiate Tailscale registration.",
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                            color = TextMuted,
+                            lineHeight = 16.sp
+                        )
+                    } else {
+                        Text(
+                            text = tailscaleLogs.joinToString("\n"),
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 10.sp,
+                            color = IndustrialEmerald,
+                            lineHeight = 15.sp
+                        )
+                    }
                 }
             }
         }

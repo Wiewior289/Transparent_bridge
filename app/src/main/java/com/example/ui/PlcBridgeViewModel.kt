@@ -65,6 +65,9 @@ class PlcBridgeViewModel(application: Application) : AndroidViewModel(applicatio
     private val _activeProfile = MutableStateFlow(DEFAULT_PROFILES[0])
     val activeProfile: StateFlow<PlcProfile> = _activeProfile.asStateFlow()
 
+    private val _tailscaleLogs = MutableStateFlow<List<String>>(emptyList())
+    val tailscaleLogs: StateFlow<List<String>> = _tailscaleLogs.asStateFlow()
+
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as PlcBridgeService.LocalBinder
@@ -82,6 +85,12 @@ class PlcBridgeViewModel(application: Application) : AndroidViewModel(applicatio
             }
             viewModelScope.launch {
                 binder.service.packetLogs.collect { _packetLogs.value = it }
+            }
+            viewModelScope.launch {
+                binder.service.tailscaleManager.connectionLog.collect { _tailscaleLogs.value = it }
+            }
+            viewModelScope.launch {
+                binder.service.tailscaleManager.config.collect { _tailscaleConfig.value = it }
             }
         }
 
@@ -198,6 +207,15 @@ class PlcBridgeViewModel(application: Application) : AndroidViewModel(applicatio
     fun updateTailscaleConfig(config: TailscaleConfig) {
         _tailscaleConfig.value = config
         bridgeService?.tailscaleManager?.updateConfig(config)
+    }
+
+    fun connectTailscale(authKey: String, nodeName: String, routes: String) {
+        _tailscaleConfig.value = _tailscaleConfig.value.copy(
+            authKey = authKey,
+            nodeName = nodeName,
+            advertisedRoutes = routes
+        )
+        bridgeService?.tailscaleManager?.startSubnetRouter(authKey, nodeName, routes)
     }
 
     fun applyProfile(profile: PlcProfile) {
