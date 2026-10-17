@@ -110,4 +110,78 @@ class ExampleUnitTest {
         val newMss = ((packet[tcpOffset + 22].toInt() and 0xFF) shl 8) or (packet[tcpOffset + 23].toInt() and 0xFF)
         assertEquals(1360, newMss)
     }
+
+    @Test
+    fun testUserlandNatSnatAndDnat() {
+        val nat = com.example.core.net.UserlandNatEngine()
+        val packet = ByteArray(44)
+        packet[0] = 0x45.toByte() // IPv4, IHL=5
+        packet[9] = 6             // TCP
+        // Orig Src IP: 100.64.15.22
+        packet[12] = 100; packet[13] = 64; packet[14] = 15; packet[15] = 22
+        // Dst IP: 192.168.1.12
+        packet[16] = 192.toByte(); packet[17] = 168.toByte(); packet[18] = 1; packet[19] = 12
+
+        // TCP Header at offset 20
+        // Src Port: 54321 (0xD431)
+        packet[20] = 0xD4.toByte(); packet[21] = 0x31
+        // Dst Port: 21 (0x0015)
+        packet[22] = 0x00; packet[23] = 0x15
+        packet[32] = 0x50.toByte() // TCP Header len = 20
+
+        // Process Outgoing SNAT
+        val snatResult = nat.processOutgoingPacket(packet, 0, 44)
+        assertTrue(snatResult)
+
+        // Check rewritten Source IP is 192.168.1.100
+        assertEquals(192.toByte(), packet[12])
+        assertEquals(168.toByte(), packet[13])
+        assertEquals(1.toByte(), packet[14])
+        assertEquals(100.toByte(), packet[15])
+
+        val masqPort = ((packet[20].toInt() and 0xFF) shl 8) or (packet[21].toInt() and 0xFF)
+
+        // Now simulate HMI response:
+        // Src IP: 192.168.1.12, Dst IP: 192.168.1.100
+        val response = ByteArray(44)
+        response[0] = 0x45.toByte()
+        response[9] = 6
+        response[12] = 192.toByte(); response[13] = 168.toByte(); response[14] = 1; response[15] = 12
+        response[16] = 192.toByte(); response[17] = 168.toByte(); response[18] = 1; response[19] = 100
+
+        // Src Port: 21, Dst Port: masqPort
+        response[20] = 0x00; response[21] = 0x15
+        response[22] = ((masqPort shr 8) and 0xFF).toByte()
+        response[23] = (masqPort and 0xFF).toByte()
+        response[32] = 0x50.toByte()
+
+        // Process Incoming DNAT
+        val dnatResult = nat.processIncomingPacket(response, 0, 44)
+        assertTrue(dnatResult)
+
+        // Destination IP should be restored to 100.64.15.22!
+        assertEquals(100.toByte(), response[16])
+        assertEquals(64.toByte(), response[17])
+        assertEquals(15.toByte(), response[18])
+        assertEquals(22.toByte(), response[19])
+
+        // Destination Port should be restored to 54321!
+        val restoredPort = ((response[22].toInt() and 0xFF) shl 8) or (response[23].toInt() and 0xFF)
+        assertEquals(54321, restoredPort)
+    }
+
+    @Test
+    fun testPendingPacketQueue() {
+        val arp = ArpEngine()
+        val dummyPacket = byteArrayOf(0x45, 0x00, 0x00, 0x28)
+
+        arp.queuePendingPacket("192.168.1.12", dummyPacket)
+        val pending = arp.getAndClearPendingPackets("192.168.1.12")
+        assertEquals(1, pending.size)
+        assertEquals(dummyPacket.size, pending[0].size)
+
+        // Queue should now be empty
+        val emptyList = arp.getAndClearPendingPackets("192.168.1.12")
+        assertTrue(emptyList.isEmpty())
+    }
 }

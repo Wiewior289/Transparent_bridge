@@ -21,14 +21,12 @@ import com.example.core.model.BridgeState
 import com.example.core.model.BridgeStats
 import com.example.core.model.EthernetConfig
 import com.example.core.model.PacketLog
-import com.example.core.model.TailscaleConfig
 import com.example.core.net.ArpEngine
 import com.example.core.net.FtpsAlg
-import com.example.core.net.MssClamper
 import com.example.core.net.RingBuffer
+import com.example.core.net.UserlandNatEngine
 import com.example.core.usb.UsbEthernetManager
 import com.example.core.vpn.TailscaleSubnetManager
-import com.example.core.vpn.UserlandIndustrialProxy
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -49,6 +47,10 @@ class PlcBridgeService : Service() {
         const val ACTION_START = "com.example.service.action.START"
         const val ACTION_STOP = "com.example.service.action.STOP"
         private const val TAG = "PlcBridgeService"
+
+        @Volatile
+        var instance: PlcBridgeService? = null
+            private set
     }
 
     inner class LocalBinder : Binder() {
@@ -65,9 +67,11 @@ class PlcBridgeService : Service() {
         private set
     lateinit var ftpsAlg: FtpsAlg
         private set
+    lateinit var natEngine: UserlandNatEngine
+        private set
     lateinit var tailscaleManager: TailscaleSubnetManager
         private set
-    private lateinit var industrialProxy: UserlandIndustrialProxy
+
     private val ringBuffer = RingBuffer(capacity = 2048, blockSize = 1600)
 
     private val _bridgeState = MutableStateFlow(BridgeState.STOPPED)
@@ -80,10 +84,20 @@ class PlcBridgeService : Service() {
     val packetLogs: StateFlow<List<PacketLog>> = _packetLogs.asStateFlow()
 
     var ethernetConfig = EthernetConfig()
+        set(value) {
+            field = value
+            if (::natEngine.isInitialized) natEngine.config = value
+            if (::arpEngine.isInitialized) {
+                arpEngine.adapterIp = ArpEngine.parseIp(value.adapterIp)
+            }
+        }
+
     private val packetIdCounter = AtomicLong(0L)
+    val totalRxBytes = AtomicLong(0L)
+    val totalTxBytes = AtomicLong(0L)
+    val totalPackets = AtomicLong(0L)
 
     private var rxJob: Job? = null
-    private var txJob: Job? = null
     private var statsJob: Job? = null
 
     private var lastRxBytes = 0L
@@ -92,16 +106,15 @@ class PlcBridgeService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         usbManager = UsbEthernetManager(this)
         arpEngine = ArpEngine(
             virtualMac = ArpEngine.parseMac(ethernetConfig.virtualMac),
             adapterIp = ArpEngine.parseIp(ethernetConfig.adapterIp)
         )
         ftpsAlg = FtpsAlg()
+        natEngine = UserlandNatEngine(ethernetConfig, ftpsAlg)
         tailscaleManager = TailscaleSubnetManager()
-        industrialProxy = UserlandIndustrialProxy(ftpsAlg) { proto, src, dst, len, info ->
-            logPacket(proto, src, dst, len, info, "", false)
-        }
 
         acquireWakeLock()
     }
@@ -131,7 +144,7 @@ class PlcBridgeService : Service() {
                 setReferenceCounted(false)
                 acquire()
             }
-            Log.i(TAG, "Acquired PARTIAL_WAKE_LOCK to prevent CPU throttling")
+            Log.i(TAG, "Acquired PARTIAL_WAKE_LOCK to prevent CPU sleep")
         }
     }
 
@@ -154,8 +167,8 @@ class PlcBridgeService : Service() {
         )
 
         val notification: Notification = NotificationCompat.Builder(this, PlcBridgeApplication.CHANNEL_ID)
-            .setContentTitle("PLC Bridge Active (Zero-Root)")
-            .setContentText("Transparent tunnel: ${ethernetConfig.adapterIp} ⇄ ${ethernetConfig.targetPlcIp}")
+            .setContentTitle("PlcBridge Active (Zero-Root NAT)")
+            .setContentText("Masquerade SNAT: ${ethernetConfig.adapterIp} ⇄ HMI ${ethernetConfig.targetPlcIp}")
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setOngoing(true)
@@ -182,10 +195,7 @@ class PlcBridgeService : Service() {
                 }
             }
 
-            // Start Userland Industrial Proxy
-            industrialProxy.start(ethernetConfig)
-
-            // Start Tailscale Subnet Router simulation/status
+            // Start Tailscale Subnet Router status
             tailscaleManager.startSubnetRouter(
                 tailscaleManager.config.value.authKey,
                 tailscaleManager.config.value.nodeName,
@@ -195,14 +205,51 @@ class PlcBridgeService : Service() {
             // Start USB Packet RX Loop
             startRxLoop()
 
-            // Start Stats Calculator Loop
+            // Start Stats Loop
             startStatsLoop()
 
             _bridgeState.value = BridgeState.RUNNING
-            logPacket("SYS", "0.0.0.0", ethernetConfig.targetPlcIp, 0, "Transparent Bridge Started", "", false)
+            logPacket("SYS", "0.0.0.0", ethernetConfig.targetPlcIp, 0, "Zero-Root NAT Bridge Started", "", false)
 
-            // Send initial Gratuitous ARP to announce our presence on the cable
+            // Send initial Gratuitous ARP to announce 192.168.1.100 on the cable
             sendGratuitousArp()
+        }
+    }
+
+    /**
+     * Handles outgoing IPv4 packets from TUN / Tailscale / Host.
+     * Applies Userland SNAT (Masquerade) to 192.168.1.100, clamps MSS to 1360,
+     * encapsulates in 14-byte Ethernet frame, and sends to USB Bulk OUT.
+     */
+    fun handleOutgoingIpPacketFromTun(packet: ByteArray, length: Int) {
+        if (length < 20) return
+        val origSrc = ArpEngine.formatIp(packet, 12)
+        val targetDst = ArpEngine.formatIp(packet, 16)
+
+        // 1. Apply Userland SNAT Masquerade (rewrite source IP to 192.168.1.100)
+        val snatSuccess = natEngine.processOutgoingPacket(packet, 0, length)
+        if (!snatSuccess) return
+
+        totalTxBytes.addAndGet(length.toLong())
+        totalPackets.incrementAndGet()
+
+        val protoNum = packet[9].toInt() and 0xFF
+        val protoStr = if (protoNum == 6) "TCP-OUT" else if (protoNum == 17) "UDP-OUT" else "IP-OUT"
+        logPacket(protoStr, origSrc, targetDst, length, "SNAT Masquerade ➔ ${ethernetConfig.adapterIp}", "", false)
+
+        // 2. Lookup MAC in ARP table
+        val dstMac = arpEngine.getMacForIp(targetDst)
+        if (dstMac != null) {
+            // Target MAC is known: wrap and send immediately
+            val frame = arpEngine.wrapInEthernetHeader(packet, 0, length, dstMac)
+            if (usbManager.isConnected) {
+                usbManager.sendFrame(frame, frame.size)
+            }
+        } else {
+            // Target MAC unknown: queue packet and broadcast ARP Request
+            Log.i(TAG, "ARP cache miss for $targetDst. Queuing packet and sending who-has query...")
+            arpEngine.queuePendingPacket(targetDst, packet.copyOfRange(0, length))
+            sendArpRequestFor(targetDst)
         }
     }
 
@@ -212,12 +259,14 @@ class PlcBridgeService : Service() {
             val rxBuffer = ByteArray(1600)
             while (isActive) {
                 if (usbManager.isConnected) {
-                    val bytesRead = usbManager.receiveFrame(rxBuffer, 25)
+                    val bytesRead = usbManager.receiveFrame(rxBuffer, 20)
                     if (bytesRead > 0) {
+                        totalRxBytes.addAndGet(bytesRead.toLong())
+                        totalPackets.incrementAndGet()
                         handleIncomingEthernetFrame(rxBuffer, bytesRead)
                     }
                 } else {
-                    delay(500)
+                    delay(300)
                 }
             }
         }
@@ -229,34 +278,54 @@ class PlcBridgeService : Service() {
 
         when (etherType) {
             0x0806 -> { // ARP Frame
-                val replyFrame = arpEngine.processIncomingFrame(frame, length)
                 val senderIp = ArpEngine.formatIp(frame, 28)
                 val targetIp = ArpEngine.formatIp(frame, 38)
+                val replyFrame = arpEngine.processIncomingFrame(frame, length)
                 logPacket("ARP", senderIp, targetIp, length, "Who-has $targetIp", bytesToHex(frame, 0, minOf(length, 32)), false)
 
-                // If ARP request targeted us, send synthesized reply back to USB
-                if (replyFrame != null) {
+                // If someone asked for 192.168.1.100, send synthetic reply
+                if (replyFrame != null && usbManager.isConnected) {
                     usbManager.sendFrame(replyFrame, replyFrame.size)
                     logPacket("ARP-REP", ethernetConfig.adapterIp, senderIp, replyFrame.size, "Is-at ${ethernetConfig.virtualMac}", "", false)
+                }
+
+                // Check if any pending packets were waiting for senderIp's MAC!
+                val senderMac = arpEngine.getMacForIp(senderIp)
+                if (senderMac != null) {
+                    val pending = arpEngine.getAndClearPendingPackets(senderIp)
+                    for (pendingIpPacket in pending) {
+                        val outFrame = arpEngine.wrapInEthernetHeader(pendingIpPacket, 0, pendingIpPacket.size, senderMac)
+                        if (usbManager.isConnected) {
+                            usbManager.sendFrame(outFrame, outFrame.size)
+                            Log.i(TAG, "Flushed queued IP packet (${pendingIpPacket.size}B) to $senderIp")
+                        }
+                    }
                 }
             }
             0x0800 -> { // IPv4 Packet
                 val ipOffset = 14
                 val ipLen = length - 14
-                var isClamped = false
+                val ipPacket = ByteArray(ipLen)
+                System.arraycopy(frame, ipOffset, ipPacket, 0, ipLen)
 
-                if (ethernetConfig.isMssClampingEnabled) {
-                    isClamped = MssClamper.clampMssInPlace(frame, ipOffset, ipLen, ethernetConfig.targetMss)
+                val srcIp = ArpEngine.formatIp(ipPacket, 12)
+                val dstIp = ArpEngine.formatIp(ipPacket, 16)
+
+                // Apply Reverse Userland DNAT (Demangle destination 192.168.1.100 back to host IP)
+                val dnatSuccess = natEngine.processIncomingPacket(ipPacket, 0, ipLen)
+                if (dnatSuccess) {
+                    val restoredDst = ArpEngine.formatIp(ipPacket, 16)
+                    val protoNum = ipPacket[9].toInt() and 0xFF
+                    val protoStr = if (protoNum == 6) "TCP-IN" else if (protoNum == 17) "UDP-IN" else "IP-IN"
+                    logPacket(protoStr, srcIp, restoredDst, ipLen, "DNAT De-masquerade ➔ $restoredDst", "", false)
+
+                    // Inject de-masqueraded packet directly into TUN interface
+                    PlcVpnService.instance?.injectPacketToTun(ipPacket, ipLen)
+                } else {
+                    logPacket("IP-DROP", srcIp, dstIp, ipLen, "No NAT session mapping found", "", false)
                 }
 
-                val protoNum = frame[ipOffset + 9].toInt() and 0xFF
-                val srcIp = ArpEngine.formatIp(frame, ipOffset + 12)
-                val dstIp = ArpEngine.formatIp(frame, ipOffset + 16)
-                val protoStr = if (protoNum == 6) "TCP" else if (protoNum == 17) "UDP" else "IPv4"
-
-                logPacket(protoStr, srcIp, dstIp, length, if (isClamped) "MSS clamped to ${ethernetConfig.targetMss}" else "Data Frame", bytesToHex(frame, 0, minOf(length, 32)), isClamped)
-                
-                // Write into pre-allocated ring buffer
+                // Also store in zero-copy ring buffer
                 ringBuffer.write(frame, 0, length)
             }
         }
@@ -267,10 +336,10 @@ class PlcBridgeService : Service() {
         statsJob = serviceScope.launch {
             while (isActive) {
                 delay(1000)
-                val rx = industrialProxy.totalRxBytes.get()
-                val tx = industrialProxy.totalTxBytes.get()
-                val pkts = industrialProxy.totalPackets.get()
-                val activeConns = industrialProxy.getActiveConnectionCount()
+                val rx = totalRxBytes.get()
+                val tx = totalTxBytes.get()
+                val pkts = totalPackets.get()
+                val activeConns = natEngine.activeSessionCount
 
                 val rxDelta = (rx - lastRxBytes).coerceAtLeast(0L)
                 val txDelta = (tx - lastTxBytes).coerceAtLeast(0L)
@@ -306,6 +375,16 @@ class PlcBridgeService : Service() {
         }
     }
 
+    fun sendArpRequestFor(targetIp: String) {
+        serviceScope.launch {
+            val req = arpEngine.buildArpRequest(ArpEngine.parseIp(targetIp))
+            if (usbManager.isConnected) {
+                usbManager.sendFrame(req, req.size)
+                logPacket("ARP-REQ", ethernetConfig.adapterIp, targetIp, req.size, "Who-has $targetIp", "", false)
+            }
+        }
+    }
+
     fun probePlc() {
         sendGratuitousArp()
     }
@@ -331,18 +410,16 @@ class PlcBridgeService : Service() {
     }
 
     fun resetStats() {
-        industrialProxy.totalRxBytes.set(0L)
-        industrialProxy.totalTxBytes.set(0L)
-        industrialProxy.totalPackets.set(0L)
+        totalRxBytes.set(0L)
+        totalTxBytes.set(0L)
+        totalPackets.set(0L)
         ringBuffer.clear()
         _stats.value = BridgeStats()
     }
 
     fun stopBridge() {
         rxJob?.cancel()
-        txJob?.cancel()
         statsJob?.cancel()
-        industrialProxy.stop()
         usbManager.disconnect()
         tailscaleManager.stopSubnetRouter()
         _bridgeState.value = BridgeState.STOPPED
@@ -354,6 +431,7 @@ class PlcBridgeService : Service() {
         stopBridge()
         releaseWakeLock()
         serviceScope.cancel()
+        instance = null
     }
 
     private fun bytesToHex(bytes: ByteArray, offset: Int, length: Int): String {

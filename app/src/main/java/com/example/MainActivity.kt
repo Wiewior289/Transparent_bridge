@@ -116,6 +116,28 @@ fun PlcBridgeApp(viewModel: PlcBridgeViewModel) {
         contract = ActivityResultContracts.RequestPermission()
     ) { /* Permission result handled */ }
 
+    // VPN Service permission preparation launcher
+    val vpnPrepareLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) {
+            viewModel.startBridge()
+        }
+    }
+
+    val onToggleBridge = {
+        if (bridgeState == BridgeState.RUNNING) {
+            viewModel.stopBridge()
+        } else {
+            val prepareIntent = android.net.VpnService.prepare(context)
+            if (prepareIntent != null) {
+                vpnPrepareLauncher.launch(prepareIntent)
+            } else {
+                viewModel.startBridge()
+            }
+        }
+    }
+
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS)
@@ -236,7 +258,7 @@ fun PlcBridgeApp(viewModel: PlcBridgeViewModel) {
                 .padding(innerPadding)
         ) {
             when (currentTab) {
-                NavItem.DASHBOARD -> DashboardScreen(viewModel = viewModel)
+                NavItem.DASHBOARD -> DashboardScreen(viewModel = viewModel, onToggleBridge = onToggleBridge)
                 NavItem.USB -> UsbScreen(viewModel = viewModel)
                 NavItem.VPN -> VpnScreen(viewModel = viewModel)
                 NavItem.ROUTING -> RoutingScreen(viewModel = viewModel)

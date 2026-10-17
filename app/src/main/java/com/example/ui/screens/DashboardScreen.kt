@@ -68,7 +68,10 @@ import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 
 @Composable
-fun DashboardScreen(viewModel: PlcBridgeViewModel) {
+fun DashboardScreen(
+    viewModel: PlcBridgeViewModel,
+    onToggleBridge: () -> Unit = { viewModel.toggleBridge() }
+) {
     val state by viewModel.bridgeState.collectAsState()
     val stats by viewModel.stats.collectAsState()
     val ethConfig by viewModel.ethernetConfig.collectAsState()
@@ -162,7 +165,7 @@ fun DashboardScreen(viewModel: PlcBridgeViewModel) {
 
                 // Primary Start/Stop Toggle
                 Button(
-                    onClick = { viewModel.toggleBridge() },
+                    onClick = { onToggleBridge() },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(52.dp)

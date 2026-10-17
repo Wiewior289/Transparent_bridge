@@ -2,10 +2,12 @@ package com.example.core.net
 
 import com.example.core.model.ArpEntry
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 
 /**
  * Handles Layer 2 / Layer 3 ARP operations without Linux kernel bridging.
  * Synthesizes ARP Replies and ARP Requests in userland.
+ * Manages pending packet queues waiting for ARP resolution so initial TCP SYNs are never dropped!
  */
 class ArpEngine(
     val virtualMac: ByteArray = parseMac("02:00:00:00:00:01"),
@@ -13,6 +15,9 @@ class ArpEngine(
 ) {
     // Dynamic ARP Table: IP -> ArpEntry
     private val arpTable = ConcurrentHashMap<String, ArpEntry>()
+
+    // Queued IP packets waiting for MAC resolution: TargetIp -> Queue of raw IP packets
+    private val pendingPackets = ConcurrentHashMap<String, ConcurrentLinkedQueue<ByteArray>>()
 
     init {
         // Initial static entry for bridge
@@ -33,6 +38,36 @@ class ArpEngine(
         } else {
             null
         }
+    }
+
+    fun queuePendingPacket(targetIp: String, ipPacket: ByteArray) {
+        val queue = pendingPackets.computeIfAbsent(targetIp) { ConcurrentLinkedQueue() }
+        if (queue.size < 64) { // Bound queue to prevent memory leak
+            queue.add(ipPacket.copyOf())
+        }
+    }
+
+    fun getAndClearPendingPackets(targetIp: String): List<ByteArray> {
+        val queue = pendingPackets.remove(targetIp) ?: return emptyList()
+        val list = mutableListOf<ByteArray>()
+        while (true) {
+            val pkt = queue.poll() ?: break
+            list.add(pkt)
+        }
+        return list
+    }
+
+    /**
+     * Wraps raw IPv4 packet in a 14-byte Ethernet frame.
+     */
+    fun wrapInEthernetHeader(ipPacket: ByteArray, ipOffset: Int, ipLen: Int, dstMac: ByteArray): ByteArray {
+        val frame = ByteArray(14 + ipLen)
+        System.arraycopy(dstMac, 0, frame, 0, 6)
+        System.arraycopy(virtualMac, 0, frame, 6, 6)
+        frame[12] = 0x08.toByte() // EtherType IPv4 (0x0800)
+        frame[13] = 0x00.toByte()
+        System.arraycopy(ipPacket, ipOffset, frame, 14, ipLen)
+        return frame
     }
 
     /**
