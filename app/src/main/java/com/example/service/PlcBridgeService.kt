@@ -114,7 +114,7 @@ class PlcBridgeService : Service() {
         )
         ftpsAlg = FtpsAlg()
         natEngine = UserlandNatEngine(ethernetConfig, ftpsAlg)
-        tailscaleManager = TailscaleSubnetManager()
+        tailscaleManager = TailscaleSubnetManager(this)
 
         acquireWakeLock()
     }
@@ -319,8 +319,9 @@ class PlcBridgeService : Service() {
                     val protoStr = if (protoNum == 6) "TCP-IN" else if (protoNum == 17) "UDP-IN" else "IP-IN"
                     logPacket(protoStr, srcIp, restoredDst, ipLen, "DNAT De-masquerade ➔ $restoredDst", "", false)
 
-                    // Inject de-masqueraded packet directly into TUN interface
+                    // Inject de-masqueraded packet directly into TUN interface and native tsnet daemon
                     PlcVpnService.instance?.injectPacketToTun(ipPacket, ipLen)
+                    tailscaleManager.injectPacketFromUsb(ipPacket, ipLen)
                 } else {
                     logPacket("IP-DROP", srcIp, dstIp, ipLen, "No NAT session mapping found", "", false)
                 }
