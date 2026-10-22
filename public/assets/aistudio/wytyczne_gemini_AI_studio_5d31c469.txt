@@ -1,0 +1,711 @@
+Kierowniku, znalazłem konkretny powód, dla którego log pokazuje niemal jednoczesne utworzenie dwóch TUN-ów i dwa otwarcia USB. To nie jest wyłącznie hipoteza wyciągnięta z logów. W kodzie są zdublowane wywołania startowe, a dodatkowo architektura rzeczywiście prowadzi ten sam pakiet powrotny dwiema ścieżkami.&#x20;
+
+MainActivity.kt
+
+PlcBridgeViewModel.kt
+
+bridge.go
+
+
+
+Pracuję na aktualnym zestawie w Bibliotece pod `/code`. Folder `/bridge/code` nie istnieje jako taka ścieżka, ale pliki, w tym `bridge.go`, są dostępne w `/code`.
+
+## 1. Diagnoza: kto uruchamia co i ile razy
+
+Obecny start mostka przebiega mniej więcej tak:
+
+`MainActivity.kt`
+
+Uruchamia `PlcVpnService` i `PlcBridgeService`, a następnie wywołuje `viewModel.startBridge()`.
+
+`PlcBridgeViewModel.startBridge()`
+
+Ponownie wysyła polecenie startu do `PlcBridgeService`, bezpośrednio wywołuje `bridgeService?.startBridge()` i jeszcze raz uruchamia `PlcVpnService`.
+
+Efekt
+
+`PlcBridgeService.startBridge()` może wystartować kilka korutyn, a `PlcVpnService.startVpnTunnel()` może rozpocząć kilka asynchronicznych prób utworzenia interfejsu.
+
+Ważny niuans: wielokrotne wysłanie Intentu do tej samej instancji usługi samo w sobie nie tworzy nowej instancji serwisu. Problemem jest to, że każde polecenie startu ponownie uruchamia logikę, a zabezpieczenia nie blokują stanu `STARTING`. W `PlcVpnService` `stopVpnTunnel()` jest wykonywane przed uruchomieniem korutyny, która dopiero później zapisuje nowy `vpnInterface`. Dwie korutyny mogą więc utworzyć `tun0` i `tun1`, zanim którakolwiek zdąży zobaczyć zasób utworzony przez drugą. To pasuje do zaobserwowanych FD `98` i `99`.&#x20;
+
+PlcVpnService.kt
+
+
+
+Jest jeszcze poważniejszy rozjazd: gdy most odbierze ramkę IPv4 z USB i przetworzy NAT, `PlcBridgeService` przekazuje ten sam pakiet do obu ujść:
+
+```
+PlcVpnService.instance?.injectPacketToTun(ipPacket, ipLen)
+tailscaleManager.injectPacketFromUsb(ipPacket, ipLen)
+```
+
+Pierwsze ujście to Androidowy `VpnService`, drugie to osadzony w procesie silnik Go/Tailscale. Nie są to dwa uchwyty do tego samego tunelu, lecz dwa różne mechanizmy transportu. W domyślnej ścieżce mostka pakiet odpowiedzi może przez to zostać wstrzyknięty dwukrotnie.&#x20;
+
+bridge.go
+
+
+
+Mój wniosek architektoniczny: dla zdalnego połączenia Windows → Tailscale → HMI najprościej utrzymać jeden główny tor: Go `UserlandTun` ↔ Kotlin ↔ USB Ethernet. Androidowy `PlcVpnService` ma sens tylko wtedy, gdy chcesz dodatkowo kierować ruch generowany przez sam telefon przez osobny Androidowy VPN. Nie powinien być uruchamiany automatycznie i dostawać tej samej odpowiedzi bez rozróżnienia, do której sesji należy pakiet.
+
+## 2. Poprawka USB: jeden właściciel połączenia, jeden cykl inicjalizacji
+
+W aktualnym `UsbEthernetManager.kt` `connectToDevice()` wywołuje `disconnect()`, później otwiera urządzenie i dopiero potem zapisuje aktywne połączenie. Nic nie chroni całego cyklu przed drugim wątkiem.&#x20;
+
+UsbEthernetManager.kt
+
+
+
+Proponuję na początek taki diff:
+
+```
+-    fun connectToDevice(device: UsbDevice): Boolean {
++    @Synchronized
++    fun connectToDevice(device: UsbDevice): Boolean {
++        // Nie otwieraj drugi raz tego samego urządzenia.
++        if (activeConnection != null &&
++            activeDevice?.deviceName == device.deviceName &&
++            activeInterface != null &&
++            inEndpoint != null &&
++            outEndpoint != null
++        ) {
++            Log.d(TAG, "Ignoring duplicate USB connect: ${device.deviceName}")
++            return true
++        }
++
+         disconnect()
+
+         if (!usbManager.hasPermission(device)) {
+             Log.e(TAG, "No USB permission for device: ${device.deviceName}")
+             return false
+         }
+```
+
+Następnie popraw sprawdzanie inicjalizacji Realteka. Obecnie `initializeChip()` zwraca wynik, ale `connectToDevice()` go ignoruje i może zgłosić sukces nawet wtedy, gdy inicjalizacja rejestrów się nie powiodła.
+
+```
+         val isRtl = device.vendorId == 0x0BDA
+         if (isRtl) {
+             val rtl = RealtekDriver(conn)
+-            rtl.initializeChip()
++            if (!rtl.initializeChip()) {
++                Log.e(TAG, "Realtek chip initialization failed")
++                disconnect()
++                return false
++            }
+             realtekDriver = rtl
+         }
+```
+
+I jeszcze porządek podczas zamykania:
+
+```
+-    fun disconnect() {
++    @Synchronized
++    fun disconnect() {
++        val conn = activeConnection
++        val iface = activeInterface
++
+         try {
+-            activeInterface?.let { activeConnection?.releaseInterface(it) }
+-            activeConnection?.close()
+-        } catch (e: Exception) {
+-            Log.w(TAG, "Error disconnecting USB device", e)
++            if (conn != null && iface != null) {
++                conn.releaseInterface(iface)
++            }
++        } catch (e: Exception) {
++            Log.w(TAG, "Error releasing USB interface", e)
+         } finally {
++            try {
++                conn?.close()
++            } catch (e: Exception) {
++                Log.w(TAG, "Error closing USB connection", e)
++            }
++
+             activeDevice = null
+             activeConnection = null
+             activeInterface = null
+             inEndpoint = null
+             outEndpoint = null
+             realtekDriver = null
+         }
+     }
+```
+
+Ten ostatni fragment zapewnia próbę zamknięcia połączenia nawet wtedy, gdy samo `releaseInterface()` zakończy się wyjątkiem. W przedstawionym wcześniej kodzie wyjątek z `releaseInterface()` przerywał zwykłe wykonanie bloku `try`, więc `close()` mógł w ogóle nie zostać wywołany.
+
+`@Synchronized` nie jest magicznym zaklęciem na całe USB. Chroni tu cykl otwierania i zamykania przed równoległym wykonaniem na tej samej instancji menedżera. Nie dodawałbym takiej samej blokady bezmyślnie do `receiveFrame()` i `sendFrame()`, bo blokujący odczyt mógłby niepotrzebnie opóźniać nadawanie.
+
+## 3. Poprawka cyklu życia mostka
+
+### A. `MainActivity.kt`: interfejs nie powinien zarządzać dwoma serwisami
+
+Usuń deklarację `vpnPrepareLauncher` obsługującą zgodę na Androidowy `VpnService`, wraz z jej kodem uruchamiającym obie usługi. Zostaw osobny launcher proszący o uprawnienie do powiadomień Androida 13+, bo to inna sprawa.
+
+Cała logika przycisku powinna sprowadzać się do:
+
+```
+val onToggleBridge = {
+    viewModel.toggleBridge()
+}
+```
+
+Aktywność nie powinna ręcznie startować `PlcVpnService`, potem `PlcBridgeService`, a na końcu prosić ViewModel o wykonanie praktycznie tego samego ponownie. Od tego jest jedna warstwa zarządzająca cyklem życia.
+
+### B. `PlcBridgeViewModel.kt`: tylko jedna droga do `PlcBridgeService`
+
+Zastąp obecne `startBridge()` i `stopBridge()` metodami, które wysyłają tylko polecenia do `PlcBridgeService`:
+
+```
+import androidx.core.content.ContextCompat
+
+fun startBridge() {
+    val intent = Intent(context, PlcBridgeService::class.java).apply {
+        action = PlcBridgeService.ACTION_START
+    }
+
+    ContextCompat.startForegroundService(context, intent)
+}
+
+fun stopBridge() {
+    val intent = Intent(context, PlcBridgeService::class.java).apply {
+        action = PlcBridgeService.ACTION_STOP
+    }
+
+    context.startService(intent)
+}
+```
+
+Usuń stąd bezpośrednie `bridgeService?.startBridge()`, `bridgeService?.stopBridge()` oraz uruchamianie `PlcVpnService`.
+
+Właścicielem inicjalizacji i zamykania zasobów ma być `PlcBridgeService`, a nie jednocześnie aktywność, ViewModel i usługa. To eliminuje potrójne wywołanie startu, które w obecnym zestawie kodu jest możliwe.&#x20;
+
+PlcBridgeViewModel.kt
+
+MainActivity.kt
+
+
+
+### C. `PlcBridgeService.kt`: stan `STARTING` także musi blokować start
+
+Oprócz zmian w UI proponuję zastąpić obecny warunek i początek `startBridge()` takim wzorcem. Wersja poniżej sprawdza też, czy urządzenie faktycznie udało się otworzyć, zamiast oznaczać mostek jako działający mimo braku adaptera:
+
+```
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+
+private var startJob: Job? = null
+
+@Synchronized
+fun startBridge(device: UsbDevice? = null) {
+    if (_bridgeState.value == BridgeState.RUNNING ||
+        _bridgeState.value == BridgeState.STARTING
+    ) {
+        Log.i(TAG, "Ignoring duplicate start: ${_bridgeState.value}")
+        return
+    }
+
+    _bridgeState.value = BridgeState.STARTING
+
+    startJob = serviceScope.launch {
+        try {
+            val targetDevice = device
+                ?: usbManager.getFirstEthernetDevice()
+                ?: throw IllegalStateException("No USB Ethernet device found")
+
+            if (!usbManager.connectToDevice(targetDevice)) {
+                throw IllegalStateException(
+                    "Failed to connect USB device: ${targetDevice.deviceName}"
+                )
+            }
+
+            currentCoroutineContext().ensureActive()
+
+            val config = tailscaleManager.config.value
+
+            tailscaleManager.startSubnetRouter(
+                config.authKey,
+                config.nodeName,
+                config.advertisedRoutes
+            )
+
+            currentCoroutineContext().ensureActive()
+
+            if (!tailscaleManager.config.value.isSubnetRoutingActive) {
+                throw IllegalStateException(
+                    "Tailscale backend did not start successfully"
+                )
+            }
+
+            startRxLoop()
+            startStatsLoop()
+
+            _bridgeState.value = BridgeState.RUNNING
+
+            logPacket(
+                "SYS",
+                "0.0.0.0",
+                ethernetConfig.targetPlcIp,
+                0,
+                "Bridge Started",
+                "",
+                false
+            )
+
+            sendGratuitousArp()
+        } catch (e: CancellationException) {
+            usbManager.disconnect()
+            tailscaleManager.stopSubnetRouter()
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Bridge startup failed", e)
+
+            rxJob?.cancel()
+            statsJob?.cancel()
+            usbManager.disconnect()
+            tailscaleManager.stopSubnetRouter()
+
+            _bridgeState.value = BridgeState.ERROR
+        }
+    }
+}
+```
+
+A do `stopBridge()` dodaj anulowanie inicjalizacji:
+
+```
+@Synchronized
+fun stopBridge() {
+    startJob?.cancel()
+    startJob = null
+
+    rxJob?.cancel()
+    statsJob?.cancel()
+
+    usbManager.disconnect()
+    tailscaleManager.stopSubnetRouter()
+
+    _bridgeState.value = BridgeState.STOPPED
+    logPacket("SYS", "0.0.0.0", "0.0.0.0", 0, "Bridge Stopped", "", false)
+}
+```
+
+`ensureActive()` jest tu istotne: samo `cancel()` nie gwarantuje, że kod wykonujący synchroniczną operację USB albo JNI natychmiast się zatrzyma. Po powrocie z takiej operacji korutyna sprawdza, czy nadal wolno jej kontynuować.
+
+Jest też jedna rzecz wymagająca uporządkowania w `PlcBridgeViewModel.connectTailscale()`: metoda niezależnie wywołuje `startSubnetRouter()`, podczas gdy `PlcBridgeService.startBridge()` również go wywołuje. Jeśli ekran Tailscale ma mieć osobny tryb startu, niech będzie to świadoma, serializowana operacja. Jeśli ma uruchamiać cały mostek, powinien korzystać z tej samej ścieżki startowej zamiast osobno uruchamiać backend.
+
+## 4. Decyzja o VPN: jeden domyślny tor pakietów
+
+Dla celu zdalnego dostępu Windows → Tailscale → Pro-face proponuję pozostawić w domyślnym trybie następującą ścieżkę:
+
+```
+Windows / GP-Pro EX
+        │
+        ▼
+Tailscale / WireGuard w Go
+        │
+        ▼
+bridge.go: UserlandTun
+        │ callback JNI
+        ▼
+PlcBridgeService
+        │ NAT + ARP + ramka Ethernet
+        ▼
+UsbEthernetManager
+        │ USB Bulk OUT
+        ▼
+Realtek ───────── HMI Pro-face
+```
+
+Powrót odbywa się odwrotnie: USB Bulk IN → zdjęcie nagłówka Ethernet → DNAT → kolejka wejściowa `UserlandTun` w Go → Tailscale/WireGuard → Windows.
+
+W tej architekturze `PlcVpnService` nie powinien być uruchamiany jako drugi, domyślny tor. Nie kasowałbym jeszcze jego pliku ani wpisu z manifestu: nie otrzymałem `AndroidManifest.xml`, więc nie mogę zweryfikować deklaracji usługi ani wszystkich potencjalnych wywołań. Najpierw odłączmy go od głównej ścieżki i sprawdźmy, czy telefon musi dodatkowo udostępniać lokalnym aplikacjom trasę do PLC.
+
+W `PlcBridgeService.handleIncomingEthernetFrame()` usuń natomiast bezwarunkowe podwójne wstrzykiwanie pakietu:
+
+```
+- PlcVpnService.instance?.injectPacketToTun(ipPacket, ipLen)
+- tailscaleManager.injectPacketFromUsb(ipPacket, ipLen)
++ val injected = tailscaleManager.injectPacketFromUsb(ipPacket, ipLen)
++ if (injected != ipLen) {
++     Log.w(TAG, "Tailscale rejected USB packet: result=$injected, length=$ipLen")
++ }
+```
+
+Przy obecnej implementacji kontrola wyniku ma znaczenie: `injectPacketFromUsb()` zwraca `0`, gdy biblioteka natywna nie jest załadowana, co można pomylić z poprawnym przetworzeniem pakietu.
+
+W `TailscaleSubnetManager.kt` gałąź dla niezaładowanej biblioteki powinna zatem zgłaszać błąd, a nie symulować połączenie:
+
+```
+} else {
+    log("ERROR: tsnetbridge native library is not loaded; start aborted")
+    _config.value = _config.value.copy(
+        isConnected = false,
+        isSubnetRoutingActive = false
+    )
+    return
+}
+```
+
+Analogicznie, `injectPacketFromUsb()` powinno zwracać `-1`, gdy biblioteka nie jest dostępna, a `stopSubnetRouter()` powinno zerować zarówno `isConnected`, jak i `isSubnetRoutingActive`.
+
+## 5. `bridge.go`: tu znajdują się blokery toru danych
+
+To najważniejsza część przeglądu. Samo usunięcie drugiego VPN nie wystarczy, bo w obecnej wersji Go ścieżka pakietowa też ma błędy.
+
+### Problem 1: callback Go → Kotlin nie jest podłączony
+
+W `bridge.go` funkcja `callJavaPacketCallback()` od razu wraca, jeśli `g_jniListener` albo `g_onPacketMethod` są puste. W aktualnym `/code/TailscaleBridgeJni.kt` nie ma deklaracji `registerPacketListener()`, a w udostępnionych plikach Kotlin nie ma metody `onTailscalePacketReceived(ByteArray, Int)`.
+
+To znaczy, że nie widzę żadnego miejsca, które ustawia globalną referencję do odbiorcy pakietów. Nawet po udanej inicjalizacji Go pakiet wychodzący z Tailscale może zostać porzucony na granicy JNI.&#x20;
+
+bridge.go
+
+TailscaleBridgeJni.kt
+
+
+
+Minimalny interfejs po stronie Kotlina musi wyglądać mniej więcej tak:
+
+```
+external fun registerPacketListener(listener: Any): Int
+```
+
+Odbiorca powinien udostępniać metodę zgodną dokładnie z sygnaturą JNI `([BI)V`:
+
+```
+@Keep
+fun onTailscalePacketReceived(packet: ByteArray, length: Int) {
+    if (length < 20 || length > packet.size) return
+    handleOutgoingIpPacketFromTun(packet, length)
+}
+```
+
+Następnie, po utworzeniu obiektów w `PlcBridgeService.onCreate()` i przed wywołaniem `startSubnetRouter()`, należy zarejestrować odbiorcę:
+
+```
+if (TailscaleBridgeJni.isLibraryLoaded) {
+    val result = TailscaleBridgeJni.registerPacketListener(this)
+    if (result != 0) {
+        Log.e(TAG, "Failed to register Tailscale packet listener: $result")
+    }
+}
+```
+
+To jest tylko połączenie callbacku z właściwą metodą. Trzeba również zadbać o czas życia referencji JNI i o jej zwolnienie przy końcowym zamknięciu, aby nie utrzymywać niepotrzebnie usługi przy życiu.
+
+### Problem 2: błędny wskaźnik do danych pakietu
+
+W `UserlandTun.Write()` jest:
+
+```
+C.callJavaPacketCallback(
+    (*C.uint8_t)(unsafe.Pointer(&packetData)),
+    C.int(len(packetData)),
+)
+```
+
+`&packetData` wskazuje na nagłówek Go slice, a nie na początek zawartości pakietu. Slice przechowuje wskaźnik, długość i pojemność. C interpretuje przekazaną lokalizację jako ciąg bajtów pakietu, więc odczytuje niewłaściwą pamięć.
+
+Poprawka:
+
+```
+ C.callJavaPacketCallback(
+-    (*C.uint8_t)(unsafe.Pointer(&packetData)),
++    (*C.uint8_t)(unsafe.Pointer(unsafe.SliceData(packetData))),
+     C.int(len(packetData)),
+ )
+```
+
+Warunek `len(packetData) > 0` już istnieje, więc `unsafe.SliceData()` nie jest tu wywoływane dla pustego pakietu. W `go.mod` projekt ma Go 1.23, a więc ta funkcja jest dostępna.&#x20;
+
+bridge.go
+
+
+
+### Problem 3: niestandardowy TUN nie emituje `tun.EventUp`
+
+Obecnie:
+
+```
+func (t *UserlandTun) Events() <-chan tun.Event {
+    return t.events
+}
+```
+
+ale kod nigdy nie wysyła zdarzenia do `events` i nigdy nie zamyka tego kanału w `Close()`.
+
+To nie jest tylko kosmetyka. Interfejs `tun.Device` przewiduje zdarzenia stanu urządzenia. W implementacji WireGuard zdarzenie `EventUp` powoduje wywołanie `device.Up()`, natomiast zamknięcie urządzenia powinno zamykać kanał zdarzeń.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://github.com\&sz=32)
+
+GitHub
+
++1
+
+
+
+Proponuję:
+
+```
+type UserlandTun struct {
+    events    chan tun.Event
+    closed    chan struct{}
+    ctx       context.Context
+    incoming  chan packetRequest
+    closeOnce sync.Once
+}
+
+func NewUserlandTun(ctx context.Context) *UserlandTun {
+    t := &UserlandTun{
+        events:   make(chan tun.Event, 1),
+        closed:   make(chan struct{}),
+        ctx:      ctx,
+        incoming: make(chan packetRequest, 2048),
+    }
+
+    t.events <- tun.EventUp
+    return t
+}
+
+func (t *UserlandTun) Close() error {
+    t.closeOnce.Do(func() {
+        close(t.closed)
+        close(t.events)
+    })
+    return nil
+}
+```
+
+`sync.Once` zabezpiecza przed paniką, gdy `Close()` zostanie wywołane ponownie. Kanał `incoming` jest teraz związany z instancją TUN, a nie globalny. W kolejnym kroku trzeba zmienić `Read()` tak, aby odbierał z `t.incoming`, a `injectPacket()` wysyłał do kolejki należącej do aktualnego `globalBridge.tun`. To zapobiega przenoszeniu starych pakietów przez globalną kolejkę pomiędzy restartami.
+
+### Problem 4: konfiguracja silnika Tailscale nie odpowiada wzorcowi wersji 1.74
+
+Projekt przypina `tailscale.com v1.74.0`, a konstrukcja `wgengine.NewUserspaceEngine()` w `bridge.go` nie przekazuje `SetSubsystem: sys.Set`. Zamiast tego kod ręcznie ustawia tylko część pól `tsd.System`:
+
+```
+sys.StateStore.Set(stateStore)
+sys.Engine.Set(eng)
+sys.Dialer.Set(dialer)
+```
+
+To nie jest równoważne pełnemu zarejestrowaniu podsystemów używanych przez backend. W oficjalnej implementacji Tailscale dla tej wersji silnik jest tworzony z `SetSubsystem: sys.Set`, `ControlKnobs: sys.ControlKnobs()` i `HealthTracker: sys.HealthTracker()`, a następnie przekazywany do systemu przed utworzeniem `LocalBackend`. Sam backend korzysta między innymi z `sys.MagicSock` i `sys.NetMon`.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://raw.githubusercontent.com\&sz=32)
+
+GitHub
+
++1
+
+
+
+Poprawiłbym tę sekcję w `startTsnet()` w następujący sposób:
+
+```
+sys := new(tsd.System)
+
+stateStore := new(mem.Store)
+sys.StateStore.Set(stateStore)
+
+dialer := &tsdial.Dialer{Logf: logger.Discard}
+
+eng, err := wgengine.NewUserspaceEngine(
+    logger.Discard,
+    wgengine.Config{
+        Tun:           uTun,
+        Router:        router.NewFake(logger.Discard),
+        Dialer:        dialer,
+        SetSubsystem:  sys.Set,
+        ControlKnobs:  sys.ControlKnobs(),
+        HealthTracker: sys.HealthTracker(),
+    },
+)
+if err != nil {
+    cancel()
+    return -1
+}
+
+sys.Set(eng)
+
+lb, err := ipnlocal.NewLocalBackend(
+    logger.Discard,
+    logid.PublicID{},
+    sys,
+    controlclient.LoginFlags(0),
+)
+if err != nil {
+    eng.Close()
+    cancel()
+    return -2
+}
+```
+
+W tej wersji usuń niepotrzebne `ht := new(health.Tracker)` oraz import `tailscale.com/health`, a także pusty obiekt `_ = &netmap.NetworkMap{}` wraz z importem `types/netmap`. W pokazanym kodzie nie pełnią żadnej funkcji.
+
+### Problem 5: wyścig na `globalBridge` w Go
+
+Kod sprawdza `globalBridge` bez globalnej blokady, a samo `running` chroni dopiero przez mutex należący do obiektu. Dwa równoległe wywołania `startTsnet()` mogą zobaczyć pusty wskaźnik i równolegle tworzyć silnik, po czym nadpisać `globalBridge`.
+
+Przy obecnych zdublowanych wywołaniach z Kotlina jest to realne ryzyko. Użyj jednej blokady cyklu życia, np.:
+
+```
+var globalMu sync.RWMutex
+```
+
+- `startTsnet()` i `stopTsnet()` powinny korzystać z blokady wyłącznej podczas zmian stanu i publikowania `globalBridge`.
+- `injectPacket()` i `getAssignedTailnetIp()` powinny używać blokady odczytu, pobrać i zweryfikować aktualny bridge oraz korzystać z niego wyłącznie w obrębie tej ochrony.
+- Kolejka pakietów powinna być własnością instancji `UserlandTun`, nie globalnym `inboundQueue`.
+
+`LocalBackend.Shutdown()` w przypiętej wersji zamyka backend i jego silnik, więc nie dodawałbym bez sprawdzenia dodatkowego, niezależnego zamykania tego samego silnika.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://raw.githubusercontent.com\&sz=32)
+
+GitHub
+
+
+
+### Problem 6: brak walidacji długości pakietu w JNI
+
+W `injectPacket()` kod robi:
+
+```
+length := int(jLen)
+goBytes := make([]byte, length)
+...
+C.memcpy(unsafe.Pointer(&goBytes[0]), unsafe.Pointer(cBytes), C.size_t(length))
+```
+
+Jeśli `jLen == 0`, odwołanie do `goBytes[0]` powoduje panikę. Jeśli długość przekracza rozmiar `jPacket`, kopiowanie może odczytywać poza granicą tablicy.
+
+Dodaj wrapper dla `GetArrayLength`:
+
+```
+static jsize jniGetByteArrayLength(JNIEnv* env, jbyteArray array) {
+    return (*env)->GetArrayLength(env, array);
+}
+```
+
+I walidację przed alokacją i kopiowaniem:
+
+```
+length := int(jLen)
+arrayLen := int(C.jniGetByteArrayLength(env, jPacket))
+
+if length <= 0 || length > arrayLen {
+    return -2
+}
+
+goBytes := make([]byte, length)
+```
+
+Na koniec jeszcze dwie rzeczy: `jDataDir` trafia do `startTsnet()`, ale w `bridge.go` jest ignorowany, bo stan tworzysz przez `mem.Store`. To oznacza, że zachowanie nie odpowiada logom sugerującym użycie katalogu danych. Dodatkowo `getAssignedTailnetIp()` zwraca sfabrykowane `100.64.0.1`, gdy faktyczny adres nie jest dostępny. Taki fallback powinien zostać usunięty, bo może oznaczyć niepołączony backend jako działający.
+
+## 6. Kolejność wdrożenia
+
+Nie robiłbym wszystkich zmian jednocześnie. W pierwszej kolejności:
+
+1. Ujednolicić start i stop w Kotlinie oraz zastosować blokadę i idempotencję w `UsbEthernetManager`.
+2. Wybrać jeden domyślny tor VPN i przestać wstrzykiwać te same odpowiedzi do `PlcVpnService` i Go.
+3. Naprawić `bridge.go`: rejestrację callbacku JNI, wskaźnik do danych pakietu, zdarzenie `EventUp`, konfigurację `wgengine` i synchronizację globalnego stanu.
+4. Dopiero wtedy budować i testować: jeden start powinien dawać jedno otwarcie urządzenia USB, jeden aktywny backend Go, jeden tor pakietów powrotnych i czytelny błąd, jeśli którakolwiek faza inicjalizacji zawiedzie.
+
+
+1. Podwójny start VPN i USB jest potwierdzony w kodzie
+Po uzyskaniu zgody na VPN MainActivity.kt uruchamia obie usługi, a następnie wywołuje viewModel.startBridge(). Ta metoda ponownie uruchamia obie usługi, a dodatkowo wywołuje bezpośrednio bridgeService?.startBridge(). MainActivity.kt
+PlcBridgeViewModel.kt
+
+
+W praktyce jedna akcja użytkownika może więc wygenerować:
+- dwa polecenia startu PlcVpnService;
+- dwa polecenia startu PlcBridgeService;
+- dodatkowe bezpośrednie wywołanie PlcBridgeService.startBridge().
+To dobrze wyjaśnia dwa deskryptory TUN (98, 99) i dwa otwarcia USB (77, 90) w logu. Usunięcie tej duplikacji powinno być pierwszą poprawką, przed dalszym diagnozowaniem EBUSY.
+2. Zasoby res są pomocne, ale mają jeden istotny problem
+Manifest poprawnie deklaruje PlcBridgeService oraz PlcVpnService, ten drugi jako usługę dziedziczącą po VpnService. Referencje do @xml/device_filter, @xml/backup_rules, @xml/data_extraction_rules i zasobów aplikacji istnieją w repozytorium. 
+
+GitHub
++3
+
+
+
+
+Natomiast device_filter.xml zawiera szeroki filtr:
+<usb-device class="255" />
+
+
+To klasa urządzeń vendor-specific, a nie identyfikator karty Ethernet. Jednocześnie UsbEthernetManager.getFirstEthernetDevice() zwraca pierwszy dowolny sprzęt USB, jeśli nie znajdzie znanego adaptera. W połączeniu te dwa mechanizmy mogą spowodować próbę inicjalizacji niewłaściwego urządzenia.
+
+Kierunek poprawki: usuń catch-all klasy 255 i zastąp fallback do pierwszego urządzenia rzeczywistym wykrywaniem adapterów Ethernet. Dla generycznego CDC-ECM/NCM trzeba sprawdzać również interfejsy USB, a nie tylko klasę urządzenia.
+3. Ważny rozjazd między Biblioteką a GitHubem
+Porównałem dwa warianty bridge.go:
+- /code/bridge.go w Bibliotece korzysta z wgengine.NewUserspaceEngine i własnego UserlandTun; to wariant powiązany z bibliotekowym go.mod, deklarującym Tailscale v1.74.0.
+- app/src/main/go/bridge.go w aktualnym GitHubie korzysta z tsnet.Server, netstack.Create oraz metod SetNetstack, UpdateEndpoints i ReceiveIPv4.
+Tymczasem app/src/main/go/go.mod w GitHubie deklaruje Tailscale v1.64.2 i Go 1.22. 
+
+GitHub
++1
+
+
+
+
+Wersja v1.64.2 nie udostępnia tych metod tsnet.Server, a pakiet netstack znajduje się pod tailscale.com/wgengine/netstack. Co więcej, netstack.Create wymaga ośmiu argumentów, nie dwóch. 
+
+GitHub
++3
+
+
+
+
+Wniosek: aktualny bridge.go w GitHubie nie jest zgodny z zadeklarowaną wersją zależności. To niezależny problem od bibliotekowego wariantu, który wrzuciłeś do /code. Nie wolno łączyć ich w jeden patch bez wyboru wersji bazowej.
+4. RealtekDriver.kt ma potencjalnie krytyczne błędy rejestrów
+To teraz jeden z najważniejszych tropów sprzętowych.
+
+W RealtekDriver.kt z Biblioteki widzę między innymi:
+const val PLA_IDR = 0x0012
+const val PLA_RMS = 0x0018
+const val PLA_CR  = 0x0016
+const val PLA_PHYSTATUS = 0x001E
+
+
+W referencyjnym sterowniku Linuksa dla RTL8152/RTL8153 te rejestry mają inne adresy:
+#define PLA_IDR       0xc000
+#define PLA_RMS       0xc016
+#define PLA_CR        0xe813
+#define PLA_PHYSTATUS 0xe908
+
+
+Również PLA_RCR to 0xc010, a nie 0x0010. 
+
+GitHub
++1
+
+
+
+
+To nie jest kosmetyka. Kotlin przekazuje te wartości bezpośrednio w controlTransfer(), więc operuje na innych adresach niż referencyjny sterownik. initializeChip() może przez to raportować sukces na podstawie samego wyniku transferu, mimo że nie skonfigurował właściwych rejestrów.
+
+Jest jeszcze jedna rzecz do sprawdzenia przed uznaniem sterownika za funkcjonalny: RTL8152/RTL8153 korzystają z własnych deskryptorów TX/RX i agregacji danych USB. Referencyjny r8152 ma jawne struktury tx_desc i rx_desc. Tymczasem nasz UsbEthernetManager przesyła przez bulkTransfer() zwykłe ramki Ethernet i traktuje odebrane bajty jako gotowe ramki. Bez obsługi formatu transferu urządzenia sam poprawny claimInterface() nie wystarczy. 
+
+GitHub
++1
+
+
+
+5. Callback Go → Kotlin nadal jest blokerem
+W wariancie bridge.go z GitHuba funkcja callJavaPacketCallback() sprawdza g_vm, g_jniListener i g_onPacketMethod, ale w tym pliku nie ma kodu, który ustawia te zmienne. Callback wraca więc bez przekazania pakietu.
+
+W wariancie w Bibliotece istnieje registerPacketListener po stronie Go, ale TailscaleBridgeJni.kt nie deklaruje tej funkcji, a w udostępnionym zestawie nie ma metody onTailscalePacketReceived(ByteArray, Int). W tej wersji callback również nie jest faktycznie podłączony. bridge.go
+TailscaleBridgeJni.kt
+
+
+Dla wariantu bibliotekowego dochodzi jeszcze błąd wskaźnika w UserlandTun.Write(): przekazane &packetData wskazuje na nagłówek slice’a, nie na zawartość pakietu.
+
+Kolejność prac po uzupełnieniu plików
+Proponuję teraz tę kolejność:
+1. Usunąć zdublowane wywołania start/stop w MainActivity i PlcBridgeViewModel, a stan STARTING traktować jako blokadę powtórnego startu.
+2. Zserializować cykl openDevice → claimInterface → zapis aktywnego połączenia i poprawić obsługę błędów zamykania USB.
+3. Ustalić jeden wariant bridge.go jako bazowy i dopasować do niego go.mod, API JNI oraz callbacki.
+4. Poprawić rejestry Realteka i zweryfikować format transferów USB na podstawie referencyjnego sterownika.
+5. Dopiero potem testować trasę pakietu od Windowsa przez Tailscale do HMI i z powrotem.
+Najważniejsza korekta względem wcześniejszego podejścia: nie ograniczałbym się już do blokady synchronizacji USB. W kodzie są co najmniej trzy niezależne klasy problemów: wielokrotna inicjalizacja, niekompletna integracja Go/JNI oraz niezgodność implementacji USB z rzeczywistym protokołem Realteka. Naprawa tylko pierwszej może usunąć podwójne FD i EBUSY, ale nie dowiedzie jeszcze, że pakiety będą poprawnie przechodzić przez adapter.

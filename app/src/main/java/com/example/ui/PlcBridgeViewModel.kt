@@ -143,32 +143,14 @@ class PlcBridgeViewModel(application: Application) : AndroidViewModel(applicatio
         val intent = Intent(context, PlcBridgeService::class.java).apply {
             action = PlcBridgeService.ACTION_START
         }
-        context.startService(intent)
-        bridgeService?.startBridge()
-
-        try {
-            val vpnIntent = Intent(context, com.example.service.PlcVpnService::class.java).apply {
-                action = com.example.service.PlcVpnService.ACTION_START_VPN
-            }
-            context.startService(vpnIntent)
-        } catch (e: Exception) {
-            android.util.Log.w("PlcBridgeViewModel", "VpnService start warning: ${e.message}")
-        }
+        androidx.core.content.ContextCompat.startForegroundService(context, intent)
     }
 
     fun stopBridge() {
-        bridgeService?.stopBridge()
         val intent = Intent(context, PlcBridgeService::class.java).apply {
             action = PlcBridgeService.ACTION_STOP
         }
         context.startService(intent)
-
-        try {
-            val vpnIntent = Intent(context, com.example.service.PlcVpnService::class.java).apply {
-                action = com.example.service.PlcVpnService.ACTION_STOP_VPN
-            }
-            context.startService(vpnIntent)
-        } catch (_: Exception) {}
     }
 
     fun toggleBridge() {

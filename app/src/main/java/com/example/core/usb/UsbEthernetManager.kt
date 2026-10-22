@@ -88,7 +88,19 @@ class UsbEthernetManager(private val context: Context) {
     /**
      * Connects to a USB Ethernet adapter, claims interface, and configures endpoints.
      */
+    @Synchronized
     fun connectToDevice(device: UsbDevice): Boolean {
+        // Nie otwieraj drugi raz tego samego urządzenia.
+        if (activeConnection != null &&
+            activeDevice?.deviceName == device.deviceName &&
+            activeInterface != null &&
+            inEndpoint != null &&
+            outEndpoint != null
+        ) {
+            Log.d(TAG, "Ignoring duplicate USB connect: ${device.deviceName}")
+            return true
+        }
+
         disconnect()
 
         if (!usbManager.hasPermission(device)) {
@@ -154,7 +166,11 @@ class UsbEthernetManager(private val context: Context) {
         val isRtl = device.vendorId == 0x0BDA
         if (isRtl) {
             val rtl = RealtekDriver(conn)
-            rtl.initializeChip()
+            if (!rtl.initializeChip()) {
+                Log.e(TAG, "Realtek chip initialization failed")
+                disconnect()
+                return false
+            }
             realtekDriver = rtl
         }
 
@@ -180,13 +196,24 @@ class UsbEthernetManager(private val context: Context) {
         return conn.bulkTransfer(ep, targetBuffer, targetBuffer.size, timeoutMs)
     }
 
+    @Synchronized
     fun disconnect() {
+        val conn = activeConnection
+        val iface = activeInterface
+
         try {
-            activeInterface?.let { activeConnection?.releaseInterface(it) }
-            activeConnection?.close()
+            if (conn != null && iface != null) {
+                conn.releaseInterface(iface)
+            }
         } catch (e: Exception) {
-            Log.w(TAG, "Error disconnecting USB device", e)
+            Log.w(TAG, "Error releasing USB interface", e)
         } finally {
+            try {
+                conn?.close()
+            } catch (e: Exception) {
+                Log.w(TAG, "Error closing USB connection", e)
+            }
+
             activeDevice = null
             activeConnection = null
             activeInterface = null
@@ -202,12 +229,29 @@ class UsbEthernetManager(private val context: Context) {
 
     fun getFirstEthernetDevice(): UsbDevice? {
         val list = usbManager.deviceList.values
-        // Prefer known Realtek or ASIX
-        val known = list.firstOrNull {
-            it.vendorId == 0x0BDA || it.vendorId == 0x0B95 ||
-            (it.deviceClass == 2 && (it.deviceSubclass == 6 || it.deviceSubclass == 13))
+        // 1. Check known Ethernet Vendor IDs: Realtek (0x0BDA), ASIX (0x0B95), Microchip (0x0424), Davicom (0x0A46)
+        val knownVendor = list.firstOrNull {
+            it.vendorId == 0x0BDA || it.vendorId == 0x0B95 || it.vendorId == 0x0424 || it.vendorId == 0x0A46
         }
-        return known ?: list.firstOrNull()
+        if (knownVendor != null) return knownVendor
+
+        // 2. Check standard CDC-ECM / CDC-NCM USB class at device or interface level
+        val cdcDevice = list.firstOrNull { device ->
+            val isCdcDevice = device.deviceClass == UsbConstants.USB_CLASS_COMM &&
+                (device.deviceSubclass == 6 || device.deviceSubclass == 13)
+            if (isCdcDevice) return@firstOrNull true
+
+            for (i in 0 until device.interfaceCount) {
+                val iface = device.getInterface(i)
+                if (iface.interfaceClass == UsbConstants.USB_CLASS_COMM &&
+                    (iface.interfaceSubclass == 6 || iface.interfaceSubclass == 13)
+                ) {
+                    return@firstOrNull true
+                }
+            }
+            false
+        }
+        return cdcDevice
     }
 
     private fun identifyChipset(vid: Int, pid: Int, device: UsbDevice): String {

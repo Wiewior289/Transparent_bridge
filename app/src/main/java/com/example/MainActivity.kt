@@ -117,56 +117,8 @@ fun PlcBridgeApp(viewModel: PlcBridgeViewModel) {
         contract = ActivityResultContracts.RequestPermission()
     ) { /* Permission result handled */ }
 
-    // VPN Service permission preparation launcher
-    val vpnPrepareLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == android.app.Activity.RESULT_OK) {
-            val vpnIntent = Intent(context, com.example.service.PlcVpnService::class.java).apply {
-                action = com.example.service.PlcVpnService.ACTION_START_VPN
-            }
-            androidx.core.content.ContextCompat.startForegroundService(context, vpnIntent)
-
-            val bridgeIntent = Intent(context, com.example.service.PlcBridgeService::class.java).apply {
-                action = com.example.service.PlcBridgeService.ACTION_START
-            }
-            androidx.core.content.ContextCompat.startForegroundService(context, bridgeIntent)
-
-            viewModel.startBridge()
-        }
-    }
-
     val onToggleBridge = {
-        if (bridgeState == BridgeState.RUNNING) {
-            val vpnIntent = Intent(context, com.example.service.PlcVpnService::class.java).apply {
-                action = com.example.service.PlcVpnService.ACTION_STOP_VPN
-            }
-            context.startService(vpnIntent)
-
-            val bridgeIntent = Intent(context, com.example.service.PlcBridgeService::class.java).apply {
-                action = com.example.service.PlcBridgeService.ACTION_STOP
-            }
-            context.startService(bridgeIntent)
-
-            viewModel.stopBridge()
-        } else {
-            val prepareIntent = android.net.VpnService.prepare(context)
-            if (prepareIntent != null) {
-                vpnPrepareLauncher.launch(prepareIntent)
-            } else {
-                val vpnIntent = Intent(context, com.example.service.PlcVpnService::class.java).apply {
-                    action = com.example.service.PlcVpnService.ACTION_START_VPN
-                }
-                androidx.core.content.ContextCompat.startForegroundService(context, vpnIntent)
-
-                val bridgeIntent = Intent(context, com.example.service.PlcBridgeService::class.java).apply {
-                    action = com.example.service.PlcBridgeService.ACTION_START
-                }
-                androidx.core.content.ContextCompat.startForegroundService(context, bridgeIntent)
-
-                viewModel.startBridge()
-            }
-        }
+        viewModel.toggleBridge()
     }
 
     LaunchedEffect(Unit) {

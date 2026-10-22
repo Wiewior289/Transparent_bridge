@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
+import androidx.annotation.Keep
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.PlcBridgeApplication
@@ -26,13 +27,17 @@ import com.example.core.net.FtpsAlg
 import com.example.core.net.RingBuffer
 import com.example.core.net.UserlandNatEngine
 import com.example.core.usb.UsbEthernetManager
+import com.example.core.vpn.TailscaleBridgeJni
 import com.example.core.vpn.TailscaleSubnetManager
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -116,6 +121,15 @@ class PlcBridgeService : Service() {
         natEngine = UserlandNatEngine(ethernetConfig, ftpsAlg)
         tailscaleManager = TailscaleSubnetManager(this)
 
+        if (TailscaleBridgeJni.isLibraryLoaded) {
+            val result = TailscaleBridgeJni.registerPacketListener(this)
+            if (result != 0) {
+                Log.e(TAG, "Failed to register Tailscale packet listener: $result")
+            } else {
+                Log.i(TAG, "Successfully registered Tailscale packet listener with native Go core")
+            }
+        }
+
         acquireWakeLock()
     }
 
@@ -182,37 +196,85 @@ class PlcBridgeService : Service() {
         }
     }
 
+    private var startJob: Job? = null
+
+    @Keep
+    fun onTailscalePacketReceived(packet: ByteArray, length: Int) {
+        if (length < 20 || length > packet.size) return
+        handleOutgoingIpPacketFromTun(packet, length)
+    }
+
+    @Synchronized
     fun startBridge(device: UsbDevice? = null) {
-        if (_bridgeState.value == BridgeState.RUNNING) return
+        if (_bridgeState.value == BridgeState.RUNNING ||
+            _bridgeState.value == BridgeState.STARTING
+        ) {
+            Log.i(TAG, "Ignoring duplicate start: ${_bridgeState.value}")
+            return
+        }
+
         _bridgeState.value = BridgeState.STARTING
 
-        serviceScope.launch {
-            val targetDevice = device ?: usbManager.getFirstEthernetDevice()
-            if (targetDevice != null) {
-                val connected = usbManager.connectToDevice(targetDevice)
-                if (connected) {
-                    Log.i(TAG, "USB Adapter connected: ${targetDevice.deviceName}")
+        startJob = serviceScope.launch {
+            try {
+                val targetDevice = device
+                    ?: usbManager.getFirstEthernetDevice()
+                    ?: throw IllegalStateException("No USB Ethernet device found")
+
+                if (!usbManager.connectToDevice(targetDevice)) {
+                    throw IllegalStateException(
+                        "Failed to connect USB device: ${targetDevice.deviceName}"
+                    )
                 }
+
+                currentCoroutineContext().ensureActive()
+
+                val config = tailscaleManager.config.value
+
+                tailscaleManager.startSubnetRouter(
+                    config.authKey,
+                    config.nodeName,
+                    config.advertisedRoutes
+                )
+
+                currentCoroutineContext().ensureActive()
+
+                if (!tailscaleManager.config.value.isSubnetRoutingActive) {
+                    throw IllegalStateException(
+                        "Tailscale backend did not start successfully"
+                    )
+                }
+
+                startRxLoop()
+                startStatsLoop()
+
+                _bridgeState.value = BridgeState.RUNNING
+
+                logPacket(
+                    "SYS",
+                    "0.0.0.0",
+                    ethernetConfig.targetPlcIp,
+                    0,
+                    "Bridge Started",
+                    "",
+                    false
+                )
+
+                sendGratuitousArp()
+            } catch (e: CancellationException) {
+                usbManager.disconnect()
+                tailscaleManager.stopSubnetRouter()
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Bridge startup failed", e)
+
+                rxJob?.cancel()
+                statsJob?.cancel()
+                usbManager.disconnect()
+                tailscaleManager.stopSubnetRouter()
+
+                _bridgeState.value = BridgeState.ERROR
             }
-
-            // Start Tailscale Subnet Router status
-            tailscaleManager.startSubnetRouter(
-                tailscaleManager.config.value.authKey,
-                tailscaleManager.config.value.nodeName,
-                tailscaleManager.config.value.advertisedRoutes
-            )
-
-            // Start USB Packet RX Loop
-            startRxLoop()
-
-            // Start Stats Loop
-            startStatsLoop()
-
-            _bridgeState.value = BridgeState.RUNNING
-            logPacket("SYS", "0.0.0.0", ethernetConfig.targetPlcIp, 0, "Zero-Root NAT Bridge Started", "", false)
-
-            // Send initial Gratuitous ARP to announce 192.168.1.100 on the cable
-            sendGratuitousArp()
         }
     }
 
@@ -319,9 +381,11 @@ class PlcBridgeService : Service() {
                     val protoStr = if (protoNum == 6) "TCP-IN" else if (protoNum == 17) "UDP-IN" else "IP-IN"
                     logPacket(protoStr, srcIp, restoredDst, ipLen, "DNAT De-masquerade ➔ $restoredDst", "", false)
 
-                    // Inject de-masqueraded packet directly into TUN interface and native tsnet daemon
-                    PlcVpnService.instance?.injectPacketToTun(ipPacket, ipLen)
-                    tailscaleManager.injectPacketFromUsb(ipPacket, ipLen)
+                    // Inject de-masqueraded packet directly to Tailscale Go daemon (single authoritative path)
+                    val injected = tailscaleManager.injectPacketFromUsb(ipPacket, ipLen)
+                    if (injected != ipLen) {
+                        Log.w(TAG, "Tailscale rejected USB packet: result=$injected, length=$ipLen")
+                    }
                 } else {
                     logPacket("IP-DROP", srcIp, dstIp, ipLen, "No NAT session mapping found", "", false)
                 }
@@ -418,11 +482,17 @@ class PlcBridgeService : Service() {
         _stats.value = BridgeStats()
     }
 
+    @Synchronized
     fun stopBridge() {
+        startJob?.cancel()
+        startJob = null
+
         rxJob?.cancel()
         statsJob?.cancel()
+
         usbManager.disconnect()
         tailscaleManager.stopSubnetRouter()
+
         _bridgeState.value = BridgeState.STOPPED
         logPacket("SYS", "0.0.0.0", "0.0.0.0", 0, "Bridge Stopped", "", false)
     }

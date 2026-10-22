@@ -18,13 +18,13 @@ class RealtekDriver(private val connection: UsbDeviceConnection) {
         const val MCU_TYPE_PLA = 0x0100
         const val MCU_TYPE_USB = 0x0000
 
-        // Important registers
-        const val PLA_IDR = 0x0012        // MAC address registers (6 bytes)
-        const val PLA_RCR = 0x0010        // Rx Configuration Register
-        const val PLA_TCR = 0x0014        // Tx Configuration Register
-        const val PLA_CR  = 0x0016        // Command Register (Enable Rx/Tx)
-        const val PLA_RMS = 0x0018        // Rx Max Packet Size
-        const val PLA_PHYSTATUS = 0x001E  // Link status
+        // Important registers from Linux kernel r8152 driver
+        const val PLA_IDR = 0xc000        // MAC address registers (6 bytes)
+        const val PLA_RCR = 0xc010        // Rx Configuration Register
+        const val PLA_TCR = 0xe610        // Tx Configuration Register
+        const val PLA_CR  = 0xe813        // Command Register (Enable Rx/Tx)
+        const val PLA_RMS = 0xc016        // Rx Max Packet Size
+        const val PLA_PHYSTATUS = 0xe908  // Link status
     }
 
     /**
@@ -49,12 +49,11 @@ class RealtekDriver(private val connection: UsbDeviceConnection) {
      * Initializes the Realtek chip in userland:
      * - Configures packet size
      * - Enables RX (Receiver) and TX (Transmitter)
-     * - Enables Accept Broadcast, Multicast, and Unicast
      */
     fun initializeChip(): Boolean {
-        // Set Rx max packet size to 1536 (standard MTU)
-        val rmsBytes = byteArrayOf(0x00, 0x06) // 1536
-        connection.controlTransfer(
+        // Set Rx max packet size to 1536 (0x0600 in little-endian byte array)
+        val rmsBytes = byteArrayOf(0x00, 0x06)
+        val rmsRes = connection.controlTransfer(
             UsbConstants.USB_DIR_OUT or UsbConstants.USB_TYPE_VENDOR,
             RTL8152_REQ_SET_REGS,
             PLA_RMS,
@@ -66,7 +65,7 @@ class RealtekDriver(private val connection: UsbDeviceConnection) {
 
         // Enable RX and TX in Command Register (PLA_CR = 0x0C)
         val crBytes = byteArrayOf(0x0C)
-        val res = connection.controlTransfer(
+        val crRes = connection.controlTransfer(
             UsbConstants.USB_DIR_OUT or UsbConstants.USB_TYPE_VENDOR,
             RTL8152_REQ_SET_REGS,
             PLA_CR,
@@ -75,7 +74,7 @@ class RealtekDriver(private val connection: UsbDeviceConnection) {
             1,
             500
         )
-        return res >= 0
+        return rmsRes >= 0 && crRes >= 0
     }
 
     /**

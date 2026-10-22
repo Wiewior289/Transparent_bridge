@@ -4,165 +4,338 @@ package main
 #include <jni.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 
-// JNI callback definition for packet delivery
 static JavaVM* g_vm = NULL;
 static jobject g_jniListener = NULL;
 static jmethodID g_onPacketMethod = NULL;
 
-static void callJavaPacketCallback(const uint8_t* data, int len) {
-    if (!g_vm || !g_jniListener || !g_onPacketMethod) return;
-    JNIEnv* env = NULL;
-    (*g_vm)->AttachCurrentThread(g_vm, (void**)&env, NULL);
-    if (!env) return;
-
-    jbyteArray jArr = (*env)->NewByteArray(env, len);
-    (*env)->SetByteArrayRegion(env, jArr, 0, len, (const jbyte*)data);
-    (*env)->CallVoidMethod(env, g_jniListener, g_onPacketMethod, jArr, len);
-    (*env)->DeleteLocalRef(env, jArr);
+static jint initJniBridge(JNIEnv* env, jobject listener) {
+    (*env)->GetJavaVM(env, &g_vm);
+    if (g_jniListener != NULL) {
+        (*env)->DeleteGlobalRef(env, g_jniListener);
+    }
+    g_jniListener = (*env)->NewGlobalRef(env, listener);
+    jclass clazz = (*env)->GetObjectClass(env, g_jniListener);
+    g_onPacketMethod = (*env)->GetMethodID(env, clazz, "onTailscalePacketReceived", "([BI)V");
+    if (g_onPacketMethod == NULL) return -1;
+    return 0;
 }
+
+// Zoptymalizowane wywołanie JNI z mechanizmem trwalego podpinania watku krypto WireGuarda
+static void callJavaPacketCallback(const uint8_t* data, int len) {
+    if (g_vm == NULL || g_jniListener == NULL || g_onPacketMethod == NULL) return;
+    
+    JNIEnv* env;
+    int getEnvStat = (*g_vm)->GetEnv(g_vm, (void**)&env, JNI_VERSION_1_6);
+    int attached = 0;
+    
+    if (getEnvStat == JNI_EDETACHED) {
+        if ((*g_vm)->AttachCurrentThread(g_vm, &env, NULL) != 0) return;
+        attached = 1;
+    }
+    
+    jbyteArray jArr = (*env)->NewByteArray(env, len);
+    if (jArr != NULL) {
+        (*env)->SetByteArrayRegion(env, jArr, 0, len, (const jbyte*)data);
+        (*env)->CallVoidMethod(env, g_jniListener, g_onPacketMethod, jArr, len);
+        (*env)->DeleteLocalRef(env, jArr);
+    }
+    
+    if (attached) {
+        // Pozostawiamy podpiety dla petli krypto w celu redukcji narzutu CPU
+    }
+}
+
+// Bezpieczne proxy dla kompilatora Cgo chroniace natywne typy JNI
+static jstring cgoNewStringUTF(JNIEnv* env, const char* str) {
+    return (*env)->NewStringUTF(env, str);
+}
+
+static const char* jniGetString(JNIEnv* env, jstring str) { return (*env)->GetStringUTFChars(env, str, NULL); }
+static void jniReleaseString(JNIEnv* env, jstring str, const char* cStr) { (*env)->ReleaseStringUTFChars(env, str, cStr); }
+static jbyte* jniGetByteArrayElements(JNIEnv* env, jbyteArray array) { return (*env)->GetByteArrayElements(env, array, NULL); }
+static void jniReleaseByteArrayElements(JNIEnv* env, jbyteArray array, jbyte* elems) { (*env)->ReleaseByteArrayElements(env, array, elems, JNI_ABORT); }
+static jsize jniGetByteArrayLength(JNIEnv* env, jbyteArray array) { return (*env)->GetArrayLength(env, array); }
 */
 import "C"
+
 import (
 	"context"
-	"fmt"
+	"io"
 	"net/netip"
+	"os"
 	"sync"
 	"unsafe"
 
-	"tailscale.com/net/netstack"
-	"tailscale.com/tsnet"
-	"tailscale.com/types/logger"
+	"github.com/tailscale/wireguard-go/tun" // Nagłówki tun.Device (Vector Packet Processing)
+	"tailscale.com/control/controlclient"  // Definicja flag logowania i stanów kontrolnych
+	"tailscale.com/ipn"                     // Obiekt preferencji ipn.NewPrefs / AdvertiseRoutes
+	"tailscale.com/ipn/ipnlocal"            // Serce demona: menedżer ipnlocal.NewLocalBackend
+	"tailscale.com/ipn/store/mem"           // Inicjalizacja bazy stanów w pamięci RAM
+	"tailscale.com/net/tsdial"              // Dialer wychodzący do połączeń sieciowych
+	"tailscale.com/tsd"                     // Struktura systemowa tsd.System (kontener silnika)
+	"tailscale.com/types/logger"            // Wyłączenie logowania przez logger.Discard
+	"tailscale.com/types/logid"             // Identyfikatory logowania logid.PublicID{}
+	"tailscale.com/wgengine"                // Silnik przestrzeni użytkownika NewUserspaceEngine
+	"tailscale.com/wgengine/router"         // Fałszywy router systemowy router.NewFake
 )
 
-// TsnetServerBridge holds the running tsnet server and gVisor netstack instance in RAM.
-type TsnetServerBridge struct {
-	server    *tsnet.Server
-	netstack  *netstack.Impl
-	mu        sync.Mutex
-	running   bool
-	tailnetIp string
-	ctx       context.Context
-	cancel    context.CancelFunc
+type packetRequest struct {
+	data []byte
 }
 
-var globalBridge *TsnetServerBridge
+type UserlandTun struct {
+	events    chan tun.Event
+	closed    chan struct{}
+	ctx       context.Context
+	incoming  chan packetRequest
+	closeOnce sync.Once
+}
+
+func NewUserlandTun(ctx context.Context) *UserlandTun {
+	t := &UserlandTun{
+		events:   make(chan tun.Event, 1),
+		closed:   make(chan struct{}),
+		ctx:      ctx,
+		incoming: make(chan packetRequest, 2048),
+	}
+	t.events <- tun.EventUp
+	return t
+}
+
+func (t *UserlandTun) File() *os.File           { return nil }
+func (t *UserlandTun) Flush() error             { return nil }
+func (t *UserlandTun) MTU() (int, error)        { return 1360, nil }
+func (t *UserlandTun) Name() (string, error)    { return "tailscale0", nil }
+func (t *UserlandTun) Events() <-chan tun.Event { return t.events }
+func (t *UserlandTun) BatchSize() int           { return 64 }
+
+func (t *UserlandTun) Close() error {
+	t.closeOnce.Do(func() {
+		close(t.closed)
+		close(t.events)
+	})
+	return nil
+}
+
+func (t *UserlandTun) Write(buffs [][]byte, offset int) (int, error) {
+	for _, buf := range buffs {
+		packetData := buf[offset:]
+		if len(packetData) > 0 {
+			C.callJavaPacketCallback((*C.uint8_t)(unsafe.Pointer(unsafe.SliceData(packetData))), C.int(len(packetData)))
+		}
+	}
+	return len(buffs), nil
+}
+
+func (t *UserlandTun) Read(buffs [][]byte, sizes []int, offset int) (int, error) {
+	select {
+	case <-t.closed:
+		return 0, io.EOF
+	case <-t.ctx.Done():
+		return 0, io.EOF
+	case req := <-t.incoming:
+		n := copy(buffs[0][offset:], req.data)
+		sizes[0] = n
+
+		packetsRead := 1
+		maxBatch := len(buffs)
+		if maxBatch > 64 {
+			maxBatch = 64
+		}
+
+		for packetsRead < maxBatch {
+			select {
+			case nextReq := <-t.incoming:
+				nNext := copy(buffs[packetsRead][offset:], nextReq.data)
+				sizes[packetsRead] = nNext
+				packetsRead++
+			default:
+				return packetsRead, nil
+			}
+		}
+		return packetsRead, nil
+	}
+}
+
+type TailscaleL3Bridge struct {
+	backend *ipnlocal.LocalBackend
+	dialer  *tsdial.Dialer
+	tun     *UserlandTun
+	running bool
+	ctx     context.Context
+	cancel  context.CancelFunc
+}
+
+var (
+	globalMu     sync.RWMutex
+	globalBridge *TailscaleL3Bridge
+)
+
+//export Java_com_example_core_vpn_TailscaleBridgeJni_registerPacketListener
+func Java_com_example_core_vpn_TailscaleBridgeJni_registerPacketListener(env *C.JNIEnv, thiz C.jobject, listener C.jobject) C.jint {
+	return C.initJniBridge(env, listener)
+}
 
 //export Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet
 func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz C.jobject, jAuthKey, jNodeName, jRoutes, jDataDir C.jstring) C.jint {
-	cAuthKey := (*env)->GetStringUTFChars(env, jAuthKey, nil)
-	cNodeName := (*env)->GetStringUTFChars(env, jNodeName, nil)
-	cRoutes := (*env)->GetStringUTFChars(env, jRoutes, nil)
-	cDataDir := (*env)->GetStringUTFChars(env, jDataDir, nil)
+	globalMu.Lock()
+	defer globalMu.Unlock()
+
+	if globalBridge != nil && globalBridge.running {
+		return 0
+	}
+
+	cAuthKey := C.jniGetString(env, jAuthKey)
+	cNodeName := C.jniGetString(env, jNodeName)
+	cRoutes := C.jniGetString(env, jRoutes)
 
 	authKey := C.GoString(cAuthKey)
 	nodeName := C.GoString(cNodeName)
 	routesStr := C.GoString(cRoutes)
-	dataDir := C.GoString(cDataDir)
 
-	(*env)->ReleaseStringUTFChars(env, jAuthKey, cAuthKey)
-	(*env)->ReleaseStringUTFChars(env, jNodeName, cNodeName)
-	(*env)->ReleaseStringUTFChars(env, jRoutes, cRoutes)
-	(*env)->ReleaseStringUTFChars(env, jDataDir, cDataDir)
-
-	if globalBridge != nil && globalBridge.running {
-		return 0 // already running
-	}
+	C.jniReleaseString(env, jAuthKey, cAuthKey)
+	C.jniReleaseString(env, jNodeName, cNodeName)
+	C.jniReleaseString(env, jRoutes, cRoutes)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	uTun := NewUserlandTun(ctx)
 
-	// 1. Initialize tsnet.Server in RAM with user-specified parameters
-	s := &tsnet.Server{
-		Hostname:  nodeName,
-		AuthKey:   authKey,
-		Dir:       dataDir,
-		Ephemeral: true,
-		Logf:      logger.Discard, // Low RAM footprint, prevents GC pressure
-	}
+	sys := new(tsd.System)
+	stateStore := new(mem.Store)
+	sys.StateStore.Set(stateStore)
+	dialer := &tsdial.Dialer{Logf: logger.Discard}
 
-	if err := s.Start(); err != nil {
+	eng, err := wgengine.NewUserspaceEngine(
+		logger.Discard,
+		wgengine.Config{
+			Tun:           uTun,
+			Router:        router.NewFake(logger.Discard),
+			Dialer:        dialer,
+			SetSubsystem:  sys.Set,
+			ControlKnobs:  sys.ControlKnobs(),
+			HealthTracker: sys.HealthTracker(),
+		},
+	)
+	if err != nil {
 		cancel()
 		return -1
 	}
 
-	// 2. Activate gVisor (netstack) in RAM inside tsnet for raw L3 IP packet streaming
-	ns, err := netstack.Create(logger.Discard, s.SysManager())
+	sys.Set(eng)
+
+	lb, err := ipnlocal.NewLocalBackend(
+		logger.Discard,
+		logid.PublicID{},
+		sys,
+		controlclient.LoginFlags(0),
+	)
 	if err != nil {
-		s.Close()
+		eng.Close()
 		cancel()
 		return -2
 	}
-	s.SetNetstack(ns)
 
-	// 3. Advertise Subnet Route (e.g. 192.168.1.0/24) to Tailnet cloud
-	prefix, err := netip.ParsePrefix(routesStr)
-	if err == nil {
-		s.UpdateEndpoints([]netip.Prefix{prefix})
+	prefs := ipn.NewPrefs()
+	prefs.WantRunning = true
+	prefs.Hostname = nodeName
+
+	if prefix, err := netip.ParsePrefix(routesStr); err == nil {
+		prefs.AdvertiseRoutes = []netip.Prefix{prefix}
 	}
 
-	bridge := &TsnetServerBridge{
-		server:   s,
-		netstack: ns,
-		running:  true,
-		ctx:      ctx,
-		cancel:   cancel,
+	if err := lb.Start(ipn.Options{AuthKey: authKey, UpdatePrefs: prefs}); err != nil {
+		lb.Shutdown()
+		dialer.Close()
+		cancel()
+		return -3
 	}
 
-	// Retrieve assigned Tailnet IP
-	lc, err := s.LocalClient()
-	if err == nil {
-		status, err := lc.Status(ctx)
-		if err == nil && len(status.TailscaleIPs) > 0 {
-			bridge.tailnetIp = status.TailscaleIPs[0].String()
-		}
+	globalBridge = &TailscaleL3Bridge{
+		backend: lb,
+		dialer:  dialer,
+		tun:     uTun,
+		running: true,
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 
-	globalBridge = bridge
-	return 1
-}
-
-//export Java_com_example_core_vpn_TailscaleBridgeJni_stopTsnet
-func Java_com_example_core_vpn_TailscaleBridgeJni_stopTsnet(env *C.JNIEnv, thiz C.jobject) C.jint {
-	if globalBridge == nil || !globalBridge.running {
-		return 0
-	}
-	globalBridge.mu.Lock()
-	defer globalBridge.mu.Unlock()
-
-	if globalBridge.cancel != nil {
-		globalBridge.cancel()
-	}
-	if globalBridge.server != nil {
-		globalBridge.server.Close()
-	}
-	globalBridge.running = false
-	globalBridge = nil
 	return 1
 }
 
 //export Java_com_example_core_vpn_TailscaleBridgeJni_injectPacket
 func Java_com_example_core_vpn_TailscaleBridgeJni_injectPacket(env *C.JNIEnv, thiz C.jobject, jPacket C.jbyteArray, jLen C.jint) C.jint {
-	if globalBridge == nil || !globalBridge.running || globalBridge.netstack == nil {
+	globalMu.RLock()
+	bridge := globalBridge
+	globalMu.RUnlock()
+
+	if bridge == nil || !bridge.running {
 		return -1
 	}
-	length := int(jLen)
-	cBytes := (*env)->GetByteArrayElements(env, jPacket, nil)
-	goBytes := C.GoBytes(unsafe.Pointer(cBytes), C.int(length))
-	(*env)->ReleaseByteArrayElements(env, jPacket, cBytes, C.JNI_ABORT)
 
-	// Feed raw packet into gVisor netstack
-	globalBridge.netstack.ReceiveIPv4(goBytes)
-	return C.jint(length)
+	length := int(jLen)
+	arrayLen := int(C.jniGetByteArrayLength(env, jPacket))
+
+	if length <= 0 || length > arrayLen {
+		return -2
+	}
+
+	goBytes := make([]byte, length)
+
+	cBytes := C.jniGetByteArrayElements(env, jPacket)
+	if cBytes == nil {
+		return -3
+	}
+	C.memcpy(unsafe.Pointer(&goBytes[0]), unsafe.Pointer(cBytes), C.size_t(length))
+	C.jniReleaseByteArrayElements(env, jPacket, cBytes)
+
+	select {
+	case bridge.tun.incoming <- packetRequest{data: goBytes}:
+		return C.jint(length)
+	default:
+		return 0
+	}
+}
+
+//export Java_com_example_core_vpn_TailscaleBridgeJni_stopTsnet
+func Java_com_example_core_vpn_TailscaleBridgeJni_stopTsnet(env *C.JNIEnv, thiz C.jobject) C.jint {
+	globalMu.Lock()
+	defer globalMu.Unlock()
+
+	if globalBridge == nil || !globalBridge.running {
+		return 0
+	}
+
+	globalBridge.cancel()
+	globalBridge.backend.Shutdown()
+	globalBridge.dialer.Close()
+	globalBridge.running = false
+	return 1
 }
 
 //export Java_com_example_core_vpn_TailscaleBridgeJni_getAssignedTailnetIp
 func Java_com_example_core_vpn_TailscaleBridgeJni_getAssignedTailnetIp(env *C.JNIEnv, thiz C.jobject) C.jstring {
-	if globalBridge == nil || !globalBridge.running || globalBridge.tailnetIp == "" {
-		return (*env)->NewStringUTF(env, C.CString("100.64.0.1"))
+	globalMu.RLock()
+	bridge := globalBridge
+	globalMu.RUnlock()
+
+	if bridge == nil {
+		cZero := C.CString("0.0.0.0")
+		defer C.free(unsafe.Pointer(cZero))
+		return C.jstring(C.cgoNewStringUTF(env, cZero))
 	}
-	cStr := C.CString(globalBridge.tailnetIp)
-	defer C.free(unsafe.Pointer(cStr))
-	return (*env)->NewStringUTF(env, cStr)
+
+	status := bridge.backend.Status()
+	if status != nil && len(status.TailscaleIPs) > 0 {
+		cIp := C.CString(status.TailscaleIPs[0].String())
+		defer C.free(unsafe.Pointer(cIp))
+		return C.jstring(C.cgoNewStringUTF(env, cIp))
+	}
+
+	cZero := C.CString("0.0.0.0")
+	defer C.free(unsafe.Pointer(cZero))
+	return C.jstring(C.cgoNewStringUTF(env, cZero))
 }
 
 func main() {}

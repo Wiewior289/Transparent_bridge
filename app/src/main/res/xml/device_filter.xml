@@ -12,6 +12,4 @@
     <!-- CDC-ECM / CDC-NCM Ethernet class -->
     <usb-device class="2" subclass="6" />
     <usb-device class="2" subclass="13" />
-    <!-- Catch-all for vendor specific USB NICs -->
-    <usb-device class="255" />
 </resources>

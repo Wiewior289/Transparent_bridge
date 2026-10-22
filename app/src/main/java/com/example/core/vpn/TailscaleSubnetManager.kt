@@ -84,13 +84,12 @@ class TailscaleSubnetManager(private val context: Context? = null) {
                 log("JNI Linkage error: ${e.message}")
             }
         } else {
-            // Native shared library not yet built or packed into APK; parameters queued for daemon
-            log("Native tsnet core bridge initialized (Go source: /app/src/main/go/bridge.go)")
-            log("AuthKey & parameters dispatched to daemon. Awaiting active WireGuard handshake.")
+            log("ERROR: tsnetbridge native library is not loaded; start aborted")
             _config.value = _config.value.copy(
-                isConnected = true,
-                isSubnetRoutingActive = true
+                isConnected = false,
+                isSubnetRoutingActive = false
             )
+            return
         }
 
         log("══════════════════════════════════════════════")
@@ -112,7 +111,7 @@ class TailscaleSubnetManager(private val context: Context? = null) {
                 -1
             }
         } else {
-            0
+            -1
         }
     }
 
@@ -125,7 +124,10 @@ class TailscaleSubnetManager(private val context: Context? = null) {
             }
         }
         log("Tailscale tsnet daemon stopped.")
-        _config.value = _config.value.copy(isConnected = false)
+        _config.value = _config.value.copy(
+            isConnected = false,
+            isSubnetRoutingActive = false
+        )
     }
 
     fun getWindowsSetupCommand(): String {

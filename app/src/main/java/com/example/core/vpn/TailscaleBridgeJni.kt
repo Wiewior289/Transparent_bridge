@@ -23,6 +23,7 @@ object TailscaleBridgeJni {
         }
     }
 
+    external fun registerPacketListener(listener: Any): Int
     external fun startTsnet(authKey: String, nodeName: String, routes: String, dataDir: String): Int
     external fun stopTsnet(): Int
     external fun injectPacket(packet: ByteArray, length: Int): Int
