@@ -229,7 +229,15 @@ class PlcBridgeService : Service() {
 
                 currentCoroutineContext().ensureActive()
 
+                if (TailscaleBridgeJni.isLibraryLoaded) {
+                    val regRes = TailscaleBridgeJni.registerPacketListener(this@PlcBridgeService)
+                    Log.i(TAG, "Registered JNI packet listener (code $regRes)")
+                }
+
                 val config = tailscaleManager.config.value
+                if (config.authKey.trim().isEmpty()) {
+                    throw IllegalStateException("Tailscale AuthKey is required to connect to Tailnet. Please provide tskey-auth-... in Tailscale settings.")
+                }
 
                 tailscaleManager.startSubnetRouter(
                     config.authKey,

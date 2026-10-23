@@ -63,7 +63,31 @@ class RealtekDriver(private val connection: UsbDeviceConnection) {
             500
         )
 
-        // Enable RX and TX in Command Register (PLA_CR = 0x0C)
+        // Configure PLA_RCR (Rx Configuration: Accept Broadcast, Multicast, Physical Match)
+        val rcrBytes = byteArrayOf(0x2E, 0x00, 0x00, 0x00)
+        val rcrRes = connection.controlTransfer(
+            UsbConstants.USB_DIR_OUT or UsbConstants.USB_TYPE_VENDOR,
+            RTL8152_REQ_SET_REGS,
+            PLA_RCR,
+            MCU_TYPE_PLA,
+            rcrBytes,
+            4,
+            500
+        )
+
+        // Configure PLA_TCR (Tx Configuration: standard interframe gap)
+        val tcrBytes = byteArrayOf(0x00, 0x00, 0x00, 0x00)
+        connection.controlTransfer(
+            UsbConstants.USB_DIR_OUT or UsbConstants.USB_TYPE_VENDOR,
+            RTL8152_REQ_SET_REGS,
+            PLA_TCR,
+            MCU_TYPE_PLA,
+            tcrBytes,
+            4,
+            500
+        )
+
+        // Enable RX and TX in Command Register (PLA_CR = 0x0C: CR_RE | CR_TE)
         val crBytes = byteArrayOf(0x0C)
         val crRes = connection.controlTransfer(
             UsbConstants.USB_DIR_OUT or UsbConstants.USB_TYPE_VENDOR,
@@ -74,7 +98,7 @@ class RealtekDriver(private val connection: UsbDeviceConnection) {
             1,
             500
         )
-        return rmsRes >= 0 && crRes >= 0
+        return rmsRes >= 0 && crRes >= 0 && rcrRes >= 0
     }
 
     /**

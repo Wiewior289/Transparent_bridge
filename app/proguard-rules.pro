@@ -19,3 +19,17 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# Preserve JNI classes, native methods, and callback handlers
+-keep class com.example.core.vpn.TailscaleBridgeJni {
+    native <methods>;
+    *;
+}
+
+-keepclassmembers class com.example.service.PlcBridgeService {
+    public void onTailscalePacketReceived(byte[], int);
+}
+
+-keepclasseswithmembernames class * {
+    native <methods>;
+}

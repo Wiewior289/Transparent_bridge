@@ -20,9 +20,21 @@ class TailscaleSubnetManager(private val context: Context? = null) {
 
     companion object {
         private const val TAG = "TailscaleSubnetManager"
+        private const val PREFS_NAME = "tailscale_prefs"
     }
 
-    private val _config = MutableStateFlow(TailscaleConfig())
+    private val prefs = context?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    private val _config = MutableStateFlow(
+        TailscaleConfig(
+            nodeName = prefs?.getString("node_name", "galaxy-s9-plc-bridge") ?: "galaxy-s9-plc-bridge",
+            advertisedRoutes = prefs?.getString("advertised_routes", "192.168.1.0/24") ?: "192.168.1.0/24",
+            authKey = prefs?.getString("auth_key", "") ?: "",
+            isConnected = false,
+            tailnetIp = "0.0.0.0",
+            isSubnetRoutingActive = false
+        )
+    )
     val config: StateFlow<TailscaleConfig> = _config.asStateFlow()
 
     private val _connectionLog = MutableStateFlow<List<String>>(emptyList())
@@ -30,6 +42,11 @@ class TailscaleSubnetManager(private val context: Context? = null) {
 
     fun updateConfig(newConfig: TailscaleConfig) {
         _config.value = newConfig
+        prefs?.edit()
+            ?.putString("node_name", newConfig.nodeName)
+            ?.putString("advertised_routes", newConfig.advertisedRoutes)
+            ?.putString("auth_key", newConfig.authKey)
+            ?.apply()
     }
 
     fun log(message: String) {
@@ -42,8 +59,14 @@ class TailscaleSubnetManager(private val context: Context? = null) {
      * Starts the native Go tsnet daemon via JNI with gVisor netstack and subnet routes.
      */
     fun startSubnetRouter(authKey: String, nodeName: String, routes: String) {
-        val trimmedKey = authKey.trim()
+        val trimmedKey = authKey.trim().ifEmpty { prefs?.getString("auth_key", "") ?: "" }
         val dataDir = context?.filesDir?.absolutePath ?: "/data/data/com.aistudio.plcbridge.vpexth/files"
+
+        prefs?.edit()
+            ?.putString("node_name", nodeName)
+            ?.putString("advertised_routes", routes)
+            ?.putString("auth_key", trimmedKey)
+            ?.apply()
 
         log("══════════════════════════════════════════════")
         log("Invoking native Go tsnet daemon (bridge.go) via JNI...")
@@ -57,7 +80,7 @@ class TailscaleSubnetManager(private val context: Context? = null) {
         )
 
         if (trimmedKey.isEmpty()) {
-            log("WARNING: Tailscale AuthKey is empty. Please provide tskey-auth-...")
+            log("ERROR: Tailscale AuthKey is empty. Please enter your tskey-auth-... in Tailscale settings.")
             return
         }
 

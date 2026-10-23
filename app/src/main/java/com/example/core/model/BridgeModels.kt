@@ -47,9 +47,9 @@ data class TailscaleConfig(
     val authKey: String = "",
     val controlUrl: String = "https://controlplane.tailscale.com",
     val isConnected: Boolean = false,
-    val tailnetIp: String = "100.64.12.45",
+    val tailnetIp: String = "0.0.0.0",
     val isEphemeral: Boolean = false,
-    val isSubnetRoutingActive: Boolean = true
+    val isSubnetRoutingActive: Boolean = false
 )
 
 data class UsbDeviceInfo(
