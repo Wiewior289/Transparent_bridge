@@ -117,85 +117,57 @@ class UsbEthernetManager(private val context: Context) {
         var epIn: UsbEndpoint? = null
         var epOut: UsbEndpoint? = null
 
-        // 1. Locate Bulk IN and Bulk OUT endpoints
+        // Select a single USB interface for Bulk I/O. Do not mix endpoints from
+        // different configurations or interfaces: Android UsbDevice exposes the
+        // current configuration's interfaces, while composite adapters may expose
+        // CDC control/data and vendor-specific alternatives.
+        var selectedInterface: UsbInterface? = null
         for (i in 0 until device.interfaceCount) {
             val iface = device.getInterface(i)
-            var currentEpIn: UsbEndpoint? = null
-            var currentEpOut: UsbEndpoint? = null
-
+            var candidateIn: UsbEndpoint? = null
+            var candidateOut: UsbEndpoint? = null
             for (e in 0 until iface.endpointCount) {
                 val ep = iface.getEndpoint(e)
-                if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
-                    if (ep.direction == UsbConstants.USB_DIR_IN && currentEpIn == null) {
-                        currentEpIn = ep
-                    } else if (ep.direction == UsbConstants.USB_DIR_OUT && currentEpOut == null) {
-                        currentEpOut = ep
-                    }
+                if (ep.type != UsbConstants.USB_ENDPOINT_XFER_BULK) continue
+                if (ep.direction == UsbConstants.USB_DIR_IN && candidateIn == null) {
+                    candidateIn = ep
+                } else if (ep.direction == UsbConstants.USB_DIR_OUT && candidateOut == null) {
+                    candidateOut = ep
                 }
             }
-
-            if (currentEpIn != null && currentEpOut != null) {
-                epIn = currentEpIn
-                epOut = currentEpOut
-                Log.i(TAG, "Found Bulk IN (${epIn.endpointNumber}) & OUT (${epOut.endpointNumber}) on interface #${iface.id}")
+            if (candidateIn != null && candidateOut != null) {
+                selectedInterface = iface
+                epIn = candidateIn
+                epOut = candidateOut
+                Log.i(TAG, "Selected Bulk IN (${epIn.endpointNumber}) / OUT (${epOut.endpointNumber}) on interface #${iface.id}, class=${iface.interfaceClass}, subclass=${iface.interfaceSubclass}, endpoints=${iface.endpointCount}")
                 break
             }
         }
 
-        // Secondary search if endpoints are on distinct interfaces
-        if (epIn == null || epOut == null) {
-            for (i in 0 until device.interfaceCount) {
-                val iface = device.getInterface(i)
-                for (e in 0 until iface.endpointCount) {
-                    val ep = iface.getEndpoint(e)
-                    if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
-                        if (ep.direction == UsbConstants.USB_DIR_IN && epIn == null) {
-                            epIn = ep
-                        } else if (ep.direction == UsbConstants.USB_DIR_OUT && epOut == null) {
-                            epOut = ep
-                        }
-                    }
-                }
-            }
-        }
-
-        if (epIn == null || epOut == null) {
-            Log.e(TAG, "Could not find Bulk IN and Bulk OUT endpoints on device")
+        if (selectedInterface == null || epIn == null || epOut == null) {
+            Log.e(TAG, "No single interface contains both Bulk IN and Bulk OUT endpoints")
             conn.close()
             return false
         }
 
-        // 2. CRITICAL: Claim ALL interfaces on the device with force = true.
-        // Multi-interface CDC-ECM/NCM and Realtek dongles have Interface 0 (Control) and Interface 1 (CDC Data).
-        // Claiming all interfaces detaches in-kernel drivers (cdc_ether, r8152) and prevents kernel warnings
-        // "did not claim interface 1 before use" and ret=-22 (EINVAL).
-        var claimedCount = 0
-        for (i in 0 until device.interfaceCount) {
-            val iface = device.getInterface(i)
-            val claimed = conn.claimInterface(iface, true)
-            Log.i(TAG, "Claiming USB interface #${iface.id} (class=${iface.interfaceClass}, sub=${iface.interfaceSubclass}): claimed=$claimed")
-            if (claimed) {
-                claimedInterfaces.add(iface)
-                claimedCount++
-            } else {
-                Log.w(TAG, "Could not claim interface #${iface.id}")
-            }
-        }
-
-        if (claimedCount == 0) {
-            Log.e(TAG, "Failed to claim any interface on device")
+        // Claim only the interface owning the selected endpoints. Claiming all
+        // interfaces caused duplicate claims and collisions with cdc_ether.
+        if (!conn.claimInterface(selectedInterface, true)) {
+            Log.e(TAG, "Failed to claim selected USB interface #${selectedInterface.id}")
             conn.close()
             return false
         }
+        claimedInterfaces.clear()
+        claimedInterfaces.add(selectedInterface)
 
         activeDevice = device
         activeConnection = conn
         inEndpoint = epIn
         outEndpoint = epOut
 
-        // 3. Initialize chipset if Realtek (VID 0x0BDA)
-        val isRtl = device.vendorId == 0x0BDA
-        if (isRtl) {
+        // Realtek-specific register initialization must never run for unrelated
+        // multi-function adapters (e.g. WCH 1a86:5394 CDC-ECM).
+        if (device.vendorId == 0x0BDA) {
             val rtl = RealtekDriver(conn)
             if (!rtl.initializeChip()) {
                 Log.e(TAG, "Realtek chip initialization failed")
@@ -205,7 +177,7 @@ class UsbEthernetManager(private val context: Context) {
             realtekDriver = rtl
         }
 
-        Log.i(TAG, "USB Ethernet Adapter connected successfully! Native FD: ${conn.fileDescriptor}, Interfaces claimed: ${claimedInterfaces.size}")
+        Log.i(TAG, "USB Ethernet Adapter opened. FD=${conn.fileDescriptor}; claimed interface=${selectedInterface.id}")
         return true
     }
 
