@@ -62,6 +62,7 @@ import "C"
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/netip"
 	"os"
@@ -219,6 +220,9 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz
 		},
 	)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "NewUserspaceEngine failed: %v\\n", err)
+		uTun.Close()
+		dialer.Close()
 		cancel()
 		return -1
 	}
