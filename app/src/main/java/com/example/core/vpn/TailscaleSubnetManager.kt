@@ -102,7 +102,12 @@ class TailscaleSubnetManager(private val context: Context? = null) {
                     log("Assigned Tailnet IP: $tailnetIp")
                 } else if (res == 0) {
                     log("Native Tailscale backend reports it is already running.")
-                    _config.value = _config.value.copy(isConnected = true, isSubnetRoutingActive = true)
+                    val tailnetIp = TailscaleBridgeJni.getAssignedTailnetIp()
+                    _config.value = _config.value.copy(
+                        isConnected = tailnetIp != "0.0.0.0",
+                        tailnetIp = tailnetIp,
+                        isSubnetRoutingActive = tailnetIp != "0.0.0.0"
+                    )
                 } else {
                     log("ERROR: native Tailscale backend startup failed, code=$res")
                     _config.value = _config.value.copy(
@@ -114,6 +119,11 @@ class TailscaleSubnetManager(private val context: Context? = null) {
                 }
             } catch (e: UnsatisfiedLinkError) {
                 log("JNI Linkage error: ${e.message}")
+            _config.value = _config.value.copy(
+                isConnected = false,
+                isSubnetRoutingActive = false,
+                tailnetIp = "0.0.0.0"
+            )
             }
         } else {
             log("ERROR: tsnetbridge native library is not loaded; start aborted")
