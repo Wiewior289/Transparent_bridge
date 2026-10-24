@@ -76,7 +76,10 @@ class TailscaleSubnetManager(private val context: Context? = null) {
         _config.value = _config.value.copy(
             nodeName = nodeName,
             advertisedRoutes = routes,
-            authKey = trimmedKey
+            authKey = trimmedKey,
+            isConnected = false,
+            isSubnetRoutingActive = false,
+            tailnetIp = "0.0.0.0"
         )
 
         if (trimmedKey.isEmpty()) {
@@ -95,13 +98,19 @@ class TailscaleSubnetManager(private val context: Context? = null) {
                         tailnetIp = tailnetIp,
                         isSubnetRoutingActive = true
                     )
-                    log("SUCCESS: tsnet.Server running in RAM via gVisor netstack!")
+                    log("SUCCESS: embedded Tailscale backend started.")
                     log("Assigned Tailnet IP: $tailnetIp")
                 } else if (res == 0) {
-                    log("tsnet.Server is already running in RAM.")
+                    log("Native Tailscale backend reports it is already running.")
                     _config.value = _config.value.copy(isConnected = true, isSubnetRoutingActive = true)
                 } else {
-                    log("ERROR: tsnet.Server.Start() returned error code $res")
+                    log("ERROR: native Tailscale backend startup failed, code=$res")
+                    _config.value = _config.value.copy(
+                        isConnected = false,
+                        isSubnetRoutingActive = false,
+                        tailnetIp = "0.0.0.0"
+                    )
+                    return
                 }
             } catch (e: UnsatisfiedLinkError) {
                 log("JNI Linkage error: ${e.message}")
@@ -115,12 +124,10 @@ class TailscaleSubnetManager(private val context: Context? = null) {
             return
         }
 
-        log("══════════════════════════════════════════════")
-        log("REMINDER (Tailscale Admin Console):")
-        log("1. Open https://login.tailscale.com/admin/machines")
-        log("2. Find machine '$nodeName' ➔ Edit route settings")
-        log("3. Approve route '$routes'")
-        log("══════════════════════════════════════════════")
+        if (_config.value.isSubnetRoutingActive) {
+            log("Backend initialization returned successfully. Check the admin console for device registration and approve the advertised route if it appears.")
+            log("Admin console: https://login.tailscale.com/admin/machines")
+        }
     }
 
     /**
