@@ -181,7 +181,7 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_registerPacketListener(env *C.
 }
 
 //export Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet
-func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz C.jobject, jAuthKey, jNodeName, jRoutes C.jstring) C.jint {
+func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz C.jobject, jAuthKey, jNodeName, jRoutes, _ C.jstring) C.jint {
 	globalMu.Lock()
 	defer globalMu.Unlock()
 
