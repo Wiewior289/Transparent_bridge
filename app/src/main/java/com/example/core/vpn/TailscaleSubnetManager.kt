@@ -60,7 +60,6 @@ class TailscaleSubnetManager(private val context: Context? = null) {
      */
     fun startSubnetRouter(authKey: String, nodeName: String, routes: String) {
         val trimmedKey = authKey.trim().ifEmpty { prefs?.getString("auth_key", "") ?: "" }
-        val dataDir = context?.filesDir?.absolutePath ?: "/data/data/com.aistudio.plcbridge.vpexth/files"
 
         prefs?.edit()
             ?.putString("node_name", nodeName)
@@ -71,7 +70,6 @@ class TailscaleSubnetManager(private val context: Context? = null) {
         log("══════════════════════════════════════════════")
         log("Invoking native Go tsnet daemon (bridge.go) via JNI...")
         log("Node: $nodeName | Subnet: $routes")
-        log("Data directory: $dataDir")
 
         _config.value = _config.value.copy(
             nodeName = nodeName,
@@ -90,16 +88,20 @@ class TailscaleSubnetManager(private val context: Context? = null) {
         if (TailscaleBridgeJni.isLibraryLoaded) {
             try {
                 log("Calling TailscaleBridgeJni.startTsnet() in Go runtime...")
-                val res = TailscaleBridgeJni.startTsnet(trimmedKey, nodeName, routes, dataDir)
+                val res = TailscaleBridgeJni.startTsnet(trimmedKey, nodeName, routes)
                 if (res > 0) {
                     val tailnetIp = TailscaleBridgeJni.getAssignedTailnetIp()
+                    val hasTailnetIp = tailnetIp != "0.0.0.0" && tailnetIp.isNotBlank()
                     _config.value = _config.value.copy(
-                        isConnected = true,
+                        isConnected = hasTailnetIp,
                         tailnetIp = tailnetIp,
-                        isSubnetRoutingActive = true
+                        isSubnetRoutingActive = hasTailnetIp
                     )
-                    log("SUCCESS: embedded Tailscale backend started.")
-                    log("Assigned Tailnet IP: $tailnetIp")
+                    if (hasTailnetIp) {
+                        log("Backend started; assigned Tailnet IP: $tailnetIp")
+                    } else {
+                        log("Backend start returned, but Tailnet IP is not available yet.")
+                    }
                 } else if (res == 0) {
                     log("Native Tailscale backend reports it is already running.")
                     val tailnetIp = TailscaleBridgeJni.getAssignedTailnetIp()

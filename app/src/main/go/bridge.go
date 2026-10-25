@@ -180,7 +180,7 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_registerPacketListener(env *C.
 }
 
 //export Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet
-func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz C.jobject, jAuthKey, jNodeName, jRoutes, jDataDir C.jstring) C.jint {
+func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz C.jobject, jAuthKey, jNodeName, jRoutes C.jstring) C.jint {
 	globalMu.Lock()
 	defer globalMu.Unlock()
 
@@ -270,14 +270,6 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz
 
 //export Java_com_example_core_vpn_TailscaleBridgeJni_injectPacket
 func Java_com_example_core_vpn_TailscaleBridgeJni_injectPacket(env *C.JNIEnv, thiz C.jobject, jPacket C.jbyteArray, jLen C.jint) C.jint {
-	globalMu.RLock()
-	bridge := globalBridge
-	globalMu.RUnlock()
-
-	if bridge == nil || !bridge.running {
-		return -1
-	}
-
 	length := int(jLen)
 	arrayLen := int(C.jniGetByteArrayLength(env, jPacket))
 
@@ -294,6 +286,16 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_injectPacket(env *C.JNIEnv, th
 	C.memcpy(unsafe.Pointer(&goBytes[0]), unsafe.Pointer(cBytes), C.size_t(length))
 	C.jniReleaseByteArrayElements(env, jPacket, cBytes)
 
+	// Keep the bridge protected until the packet has been queued. stopTsnet
+	// cannot tear down the TUN while this operation is in flight.
+	globalMu.RLock()
+	defer globalMu.RUnlock()
+
+	bridge := globalBridge
+	if bridge == nil || !bridge.running {
+		return -1
+	}
+
 	select {
 	case bridge.tun.incoming <- packetRequest{data: goBytes}:
 		return C.jint(length)
@@ -305,26 +307,32 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_injectPacket(env *C.JNIEnv, th
 //export Java_com_example_core_vpn_TailscaleBridgeJni_stopTsnet
 func Java_com_example_core_vpn_TailscaleBridgeJni_stopTsnet(env *C.JNIEnv, thiz C.jobject) C.jint {
 	globalMu.Lock()
-	defer globalMu.Unlock()
-
-	if globalBridge == nil || !globalBridge.running {
+	bridge := globalBridge
+	if bridge == nil || !bridge.running {
+		globalMu.Unlock()
 		return 0
 	}
 
-	globalBridge.cancel()
-	globalBridge.backend.Shutdown()
-	globalBridge.dialer.Close()
-	globalBridge.running = false
+	// Detach the runtime from the global entry point before teardown so new
+	// JNI calls cannot acquire a bridge that is shutting down.
+	bridge.running = false
+	globalBridge = nil
+	globalMu.Unlock()
+
+	bridge.cancel()
+	bridge.backend.Shutdown()
+	bridge.dialer.Close()
+	_ = bridge.tun.Close()
 	return 1
 }
 
 //export Java_com_example_core_vpn_TailscaleBridgeJni_getAssignedTailnetIp
 func Java_com_example_core_vpn_TailscaleBridgeJni_getAssignedTailnetIp(env *C.JNIEnv, thiz C.jobject) C.jstring {
 	globalMu.RLock()
-	bridge := globalBridge
-	globalMu.RUnlock()
+	defer globalMu.RUnlock()
 
-	if bridge == nil {
+	bridge := globalBridge
+	if bridge == nil || !bridge.running {
 		cZero := C.CString("0.0.0.0")
 		defer C.free(unsafe.Pointer(cZero))
 		return C.jstring(C.cgoNewStringUTF(env, cZero))
