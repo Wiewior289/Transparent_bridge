@@ -170,8 +170,9 @@ type TailscaleL3Bridge struct {
 }
 
 var (
-	globalMu     sync.RWMutex
-	globalBridge *TailscaleL3Bridge
+	globalMu      sync.RWMutex
+	globalBridge  *TailscaleL3Bridge
+	globalStopping bool
 )
 
 //export Java_com_example_core_vpn_TailscaleBridgeJni_registerPacketListener
@@ -184,6 +185,10 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz
 	globalMu.Lock()
 	defer globalMu.Unlock()
 
+	// Do not create a second runtime while the previous one is still tearing down.
+	if globalStopping {
+		return -4
+	}
 	if globalBridge != nil && globalBridge.running {
 		return 0
 	}
@@ -317,12 +322,17 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_stopTsnet(env *C.JNIEnv, thiz 
 	// JNI calls cannot acquire a bridge that is shutting down.
 	bridge.running = false
 	globalBridge = nil
+	globalStopping = true
 	globalMu.Unlock()
 
 	bridge.cancel()
 	bridge.backend.Shutdown()
 	bridge.dialer.Close()
 	_ = bridge.tun.Close()
+
+	globalMu.Lock()
+	globalStopping = false
+	globalMu.Unlock()
 	return 1
 }
 
