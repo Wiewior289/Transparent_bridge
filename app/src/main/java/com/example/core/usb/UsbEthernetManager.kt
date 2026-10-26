@@ -351,7 +351,15 @@ class UsbEthernetManager(private val context: Context) {
         val list = usbManager.deviceList.values
         currentAttemptId = attemptCounter.incrementAndGet()
         diag("DEVICE SELECTION START discoveredCount=" + list.size)
-        list.forEach { d -> diag("DISCOVERED name=" + d.deviceName + " VID=0x" + d.vendorId.toString(16) + " PID=0x" + d.productId.toString(16) + " class=" + d.deviceClass + "/" + d.deviceSubclass + "/" + d.deviceProtocol + " interfaces=" + d.interfaceCount + " permission=" + usbManager.hasPermission(d)) }
+        list.forEach { d ->
+            diag("DISCOVERED name=" + d.deviceName + " VID=0x" + d.vendorId.toString(16) + " PID=0x" + d.productId.toString(16) + " class=" + d.deviceClass + "/" + d.deviceSubclass + "/" + d.deviceProtocol + " interfaces=" + d.interfaceCount + " permission=" + usbManager.hasPermission(d))
+            for (i in 0 until d.interfaceCount) {
+                val candidateInterface = d.getInterface(i)
+                diag("DISCOVERED-INTERFACE device=" + d.deviceName + " index=" + i + " id=" + candidateInterface.id +
+                    " alt=" + candidateInterface.alternateSetting + " class=" + candidateInterface.interfaceClass + "/" +
+                    candidateInterface.interfaceSubclass + "/" + candidateInterface.interfaceProtocol + " endpoints=" + candidateInterface.endpointCount)
+            }
+        }
         // 1. Check known Ethernet Vendor IDs: Realtek (0x0BDA), ASIX (0x0B95), Microchip (0x0424), Davicom (0x0A46)
         val knownVendor = list.firstOrNull {
             it.vendorId == 0x0BDA || it.vendorId == 0x0B95 || it.vendorId == 0x0424 || it.vendorId == 0x0A46
