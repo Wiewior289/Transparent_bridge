@@ -49,7 +49,9 @@ data class TailscaleConfig(
     val isConnected: Boolean = false,
     val tailnetIp: String = "0.0.0.0",
     val isEphemeral: Boolean = false,
-    val isSubnetRoutingActive: Boolean = false
+    val isSubnetRoutingActive: Boolean = false,
+    val isRuntimeStarted: Boolean = false,
+    val backendState: String = "STOPPED"
 )
 
 data class UsbDeviceInfo(
