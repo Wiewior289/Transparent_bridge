@@ -44,9 +44,9 @@ class UsbEthernetManager(private val context: Context) {
             " product=" + (device.productName ?: "?") + " permission=" + usbManager.hasPermission(device))
         for (ci in 0 until device.configurationCount) {
             val cfg = device.getConfiguration(ci)
-            diag("CONFIG index=" + ci + " id=" + cfg.id + " value=" + cfg.configurationValue +
+            diag("CONFIG index=" + ci + " id=" + cfg.id +
                 " name=" + (cfg.name ?: "?") + " interfaces=" + cfg.interfaceCount +
-                " attributes=0x" + cfg.attributes.toString(16) + " maxPower=" + cfg.maxPower)
+                " selfPowered=" + cfg.isSelfPowered + " remoteWakeup=" + cfg.isRemoteWakeup + " maxPower=" + cfg.maxPower)
         }
         // UsbDevice.getInterface() lists interfaces exposed by Android for the active configuration.
         for (i in 0 until device.interfaceCount) {
