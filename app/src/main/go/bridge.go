@@ -1,7 +1,9 @@
 package main
 
 /*
+#cgo LDFLAGS: -llog
 #include <jni.h>
+#include <android/log.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -9,6 +11,30 @@ package main
 static JavaVM* g_vm = NULL;
 static jobject g_jniListener = NULL;
 static jmethodID g_onPacketMethod = NULL;
+static jmethodID g_getInterfacesMethod = NULL;
+static void bridgeAndroidLog(const char* msg) {
+    __android_log_write(ANDROID_LOG_INFO, "TSBridgeGo", msg ? msg : "(null)");
+}
+static char* bridgeGetInterfacesJSON(void) {
+    if (g_vm == NULL || g_jniListener == NULL || g_getInterfacesMethod == NULL) return NULL;
+    JNIEnv* env = NULL; int attached = 0;
+    jint status = (*g_vm)->GetEnv(g_vm, (void**)&env, JNI_VERSION_1_6);
+    if (status == JNI_EDETACHED) {
+        if ((*g_vm)->AttachCurrentThread(g_vm, &env, NULL) != JNI_OK) return NULL;
+        attached = 1;
+    } else if (status != JNI_OK) return NULL;
+    jstring value = (jstring)(*env)->CallObjectMethod(env, g_jniListener, g_getInterfacesMethod);
+    char* result = NULL;
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env);
+    } else if (value != NULL) {
+        const char* chars = (*env)->GetStringUTFChars(env, value, NULL);
+        if (chars != NULL) { result = strdup(chars); (*env)->ReleaseStringUTFChars(env, value, chars); }
+        (*env)->DeleteLocalRef(env, value);
+    }
+    if (attached) (*g_vm)->DetachCurrentThread(g_vm);
+    return result;
+}
 
 static jint initJniBridge(JNIEnv* env, jobject listener) {
     (*env)->GetJavaVM(env, &g_vm);
@@ -19,6 +45,8 @@ static jint initJniBridge(JNIEnv* env, jobject listener) {
     jclass clazz = (*env)->GetObjectClass(env, g_jniListener);
     g_onPacketMethod = (*env)->GetMethodID(env, clazz, "onTailscalePacketReceived", "([BI)V");
     if (g_onPacketMethod == NULL) return -1;
+    g_getInterfacesMethod = (*env)->GetMethodID(env, clazz, "getTailscaleInterfacesJson", "()Ljava/lang/String;");
+    if (g_getInterfacesMethod == NULL) return -2;
     return 0;
 }
 
@@ -62,8 +90,10 @@ import "C"
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/netip"
 	"os"
 	"sync"
@@ -74,14 +104,66 @@ import (
 	"tailscale.com/ipn"                     // Obiekt preferencji ipn.NewPrefs / AdvertiseRoutes
 	"tailscale.com/ipn/ipnlocal"            // Serce demona: menedżer ipnlocal.NewLocalBackend
 	"tailscale.com/ipn/store/mem"           // Inicjalizacja bazy stanów w pamięci RAM
+	"tailscale.com/net/netmon"              // Android interface provider for SDK 30+
 	"tailscale.com/net/tsdial"              // Dialer wychodzący do połączeń sieciowych
 	"tailscale.com/tsd"                     // Struktura systemowa tsd.System (kontener silnika)
-	"tailscale.com/types/logger"            // Wyłączenie logowania przez logger.Discard
 	"tailscale.com/types/logid"             // Identyfikatory logowania logid.PublicID{}
 	"tailscale.com/wgengine"                // Silnik przestrzeni użytkownika NewUserspaceEngine
 	"tailscale.com/wgengine/router"         // Fałszywy router systemowy router.NewFake
 )
 
+type androidAddrJSON struct {
+	IP string `json:"ip"`
+	PrefixLen int `json:"prefixLen"`
+}
+type androidIfaceJSON struct {
+	Name string `json:"name"`
+	Index int `json:"index"`
+	MTU int `json:"mtu"`
+	Up bool `json:"up"`
+	Broadcast bool `json:"broadcast"`
+	Loopback bool `json:"loopback"`
+	PointToPoint bool `json:"pointToPoint"`
+	Multicast bool `json:"multicast"`
+	Addrs []androidAddrJSON `json:"addrs"`
+}
+func bridgeLogf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	cmsg := C.CString(msg)
+	defer C.free(unsafe.Pointer(cmsg))
+	C.bridgeAndroidLog(cmsg)
+}
+// androidInterfaceGetter avoids Go's default net.Interfaces() path, documented
+// by Tailscale as unavailable on Android SDK 30+ under platform policy.
+func androidInterfaceGetter() ([]netmon.Interface, error) {
+	cJSON := C.bridgeGetInterfacesJSON()
+	if cJSON == nil { return nil, fmt.Errorf("Android interface provider returned null JSON (JNI callback missing or failed)") }
+	defer C.free(unsafe.Pointer(cJSON))
+	var raw []androidIfaceJSON
+	if err := json.Unmarshal([]byte(C.GoString(cJSON)), &raw); err != nil {
+		return nil, fmt.Errorf("parse Android interface JSON: %w", err)
+	}
+	out := make([]netmon.Interface, 0, len(raw))
+	for _, it := range raw {
+		if it.Name == "" { continue }
+		iface := &net.Interface{Name: it.Name, Index: it.Index, MTU: it.MTU}
+		if it.Up { iface.Flags |= net.FlagUp }
+		if it.Broadcast { iface.Flags |= net.FlagBroadcast }
+		if it.Loopback { iface.Flags |= net.FlagLoopback }
+		if it.PointToPoint { iface.Flags |= net.FlagPointToPoint }
+		if it.Multicast { iface.Flags |= net.FlagMulticast }
+		ni := netmon.Interface{Interface: iface, AltAddrs: []net.Addr{}}
+		for _, addr := range it.Addrs {
+			ip, ipNet, err := net.ParseCIDR(fmt.Sprintf("%s/%d", addr.IP, addr.PrefixLen))
+			if err != nil { bridgeLogf("netmon: skip invalid address %q/%d on %s: %v", addr.IP, addr.PrefixLen, it.Name, err); continue }
+			ipNet.IP = ip
+			ni.AltAddrs = append(ni.AltAddrs, ipNet)
+		}
+		out = append(out, ni)
+	}
+	bridgeLogf("Android interface provider returned %d interfaces", len(out))
+	return out, nil
+}
 type packetRequest struct {
 	data []byte
 }
@@ -211,13 +293,16 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz
 	sys := new(tsd.System)
 	stateStore := new(mem.Store)
 	sys.StateStore.Set(stateStore)
-	dialer := &tsdial.Dialer{Logf: logger.Discard}
+	bridgeLogf("startup: runtime allocated; registering Android netmon interface getter")
+	netmon.RegisterInterfaceGetter(androidInterfaceGetter)
+	dialer := &tsdial.Dialer{Logf: bridgeLogf}
 
+	bridgeLogf("startup: NewUserspaceEngine begin (Android polling monitor + Android interface getter)")
 	eng, err := wgengine.NewUserspaceEngine(
-		logger.Discard,
+		bridgeLogf,
 		wgengine.Config{
 			Tun:           uTun,
-			Router:        router.NewFake(logger.Discard),
+			Router:        router.NewFake(bridgeLogf),
 			Dialer:        dialer,
 			SetSubsystem:  sys.Set,
 			ControlKnobs:  sys.ControlKnobs(),
@@ -232,19 +317,22 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz
 		return -1
 	}
 
+	bridgeLogf("startup: NewUserspaceEngine success")
 	sys.Set(eng)
 
+	bridgeLogf("startup: NewLocalBackend begin")
 	lb, err := ipnlocal.NewLocalBackend(
-		logger.Discard,
+		bridgeLogf,
 		logid.PublicID{},
 		sys,
 		controlclient.LoginFlags(0),
 	)
 	if err != nil {
+		bridgeLogf("startup: NewLocalBackend failed: %v", err)
 		eng.Close()
 		cancel()
 		return -2
-	}
+}
 
 	prefs := ipn.NewPrefs()
 	prefs.WantRunning = true
@@ -254,13 +342,16 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz
 		prefs.AdvertiseRoutes = []netip.Prefix{prefix}
 	}
 
+	bridgeLogf("startup: LocalBackend.Start begin; auth key present=%t, routes=%s", authKey != "", routesStr)
 	if err := lb.Start(ipn.Options{AuthKey: authKey, UpdatePrefs: prefs}); err != nil {
+		bridgeLogf("startup: LocalBackend.Start failed: %v", err)
 		lb.Shutdown()
 		dialer.Close()
 		cancel()
 		return -3
 	}
 
+	bridgeLogf("startup: LocalBackend.Start returned successfully")
 	globalBridge = &TailscaleL3Bridge{
 		backend: lb,
 		dialer:  dialer,

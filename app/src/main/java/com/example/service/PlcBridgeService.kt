@@ -44,6 +44,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicLong
+import java.net.NetworkInterface
+import org.json.JSONArray
+import org.json.JSONObject
 
 class PlcBridgeService : Service() {
 
@@ -202,6 +205,37 @@ class PlcBridgeService : Service() {
     fun onTailscalePacketReceived(packet: ByteArray, length: Int) {
         if (length < 20 || length > packet.size) return
         handleOutgoingIpPacketFromTun(packet, length)
+    }
+
+    /** Android SDK 30+ provider used instead of Go net.Interfaces(). */
+    @Keep
+    fun getTailscaleInterfacesJson(): String {
+        val result = JSONArray()
+        val interfaces = NetworkInterface.getNetworkInterfaces() ?: return result.toString()
+        while (interfaces.hasMoreElements()) {
+            val ni = interfaces.nextElement()
+            val item = JSONObject()
+            item.put("name", ni.name)
+            item.put("index", ni.index)
+            item.put("mtu", try { ni.mtu } catch (_: Exception) { 0 })
+            item.put("up", try { ni.isUp } catch (_: Exception) { false })
+            item.put("broadcast", false)
+            item.put("loopback", try { ni.isLoopback } catch (_: Exception) { false })
+            item.put("pointToPoint", try { ni.isPointToPoint } catch (_: Exception) { false })
+            item.put("multicast", try { ni.supportsMulticast() } catch (_: Exception) { false })
+            val addrs = JSONArray()
+            for (entry in ni.interfaceAddresses) {
+                val address = entry.address ?: continue
+                val addr = JSONObject()
+                addr.put("ip", address.hostAddress.substringBefore('%'))
+                addr.put("prefixLen", entry.networkPrefixLength.toInt())
+                addrs.put(addr)
+            }
+            item.put("addrs", addrs)
+            result.put(item)
+        }
+        Log.i(TAG, "Android netmon provider enumerated ${result.length()} interfaces")
+        return result.toString()
     }
 
     @Synchronized
