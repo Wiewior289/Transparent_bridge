@@ -25,8 +25,10 @@ class UsbEthernetManager(private val context: Context) {
     private val usbManager: UsbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
     @Volatile var diagnosticListener: ((String) -> Unit)? = null
     @Volatile private var currentAttemptId: Long = 0L
+    @Volatile private var pendingSelectedDeviceName: String? = null
     private var rxSamples = 0
     private var txSamples = 0
+    private var rxNoDataCount = 0
 
     private fun diag(message: String, error: Boolean = false) {
         val line = "[USB#" + currentAttemptId + "] " + message
@@ -64,8 +66,12 @@ class UsbEthernetManager(private val context: Context) {
     }
 
     private fun logTransfer(kind: String, ep: UsbEndpoint, result: Int, requested: Int) {
-        if (result <= 0) diag(kind + " BULK result=" + result + " requested=" + requested +
-            " endpoint=0x" + ep.address.toString(16) + (if (result < 0) " no-data/timeout-or-error" else " zero-bytes"))
+        if (result <= 0) {
+            if (kind == "RX" && result < 0) {
+                rxNoDataCount++
+                if (rxNoDataCount <= 3 || rxNoDataCount % 100 == 0) diag("RX BULK result=" + result + " requested=" + requested + " endpoint=0x" + ep.address.toString(16) + " no-data/timeout-or-error count=" + rxNoDataCount)
+            } else diag(kind + " BULK result=" + result + " requested=" + requested + " endpoint=0x" + ep.address.toString(16) + (if (result < 0) " error" else " zero-bytes"), result < 0)
+        }
         else if (kind == "RX" && rxSamples++ < 5) diag("RX BULK positive result=" + result + " requested=" + requested + " endpoint=0x" + ep.address.toString(16) + " sample=" + rxSamples)
         else if (kind == "TX" && txSamples++ < 5) diag("TX BULK positive result=" + result + " requested=" + requested + " endpoint=0x" + ep.address.toString(16) + " sample=" + txSamples)
     }
@@ -134,13 +140,15 @@ class UsbEthernetManager(private val context: Context) {
     }
 
     /**
-     * Connects to a USB Ethernet adapter, claims ALL interfaces (control and data),
-     * detaches kernel drivers, and configures endpoints.
+     * Opens the chosen USB device, enumerates its exposed descriptors, claims the
+     * one interface owning the selected bulk endpoints, and records transfer results.
      */
     @Synchronized
     fun connectToDevice(device: UsbDevice): Boolean {
-        currentAttemptId = attemptCounter.incrementAndGet(); rxSamples = 0; txSamples = 0
-        diag("ATTEMPT START connectToDevice"); dumpDevice(device)
+        if (pendingSelectedDeviceName != device.deviceName) currentAttemptId = attemptCounter.incrementAndGet()
+        pendingSelectedDeviceName = null
+        rxSamples = 0; txSamples = 0; rxNoDataCount = 0
+        diag("CONNECT ATTEMPT START device=" + device.deviceName); dumpDevice(device)
         // Nie otwieraj drugi raz tego samego urządzenia.
         if (activeConnection != null &&
             activeDevice?.deviceName == device.deviceName &&
@@ -348,7 +356,7 @@ class UsbEthernetManager(private val context: Context) {
         val knownVendor = list.firstOrNull {
             it.vendorId == 0x0BDA || it.vendorId == 0x0B95 || it.vendorId == 0x0424 || it.vendorId == 0x0A46
         }
-        if (knownVendor != null) { diag("DEVICE SELECTED known VID: " + knownVendor.deviceName + " VID=0x" + knownVendor.vendorId.toString(16) + " PID=0x" + knownVendor.productId.toString(16)); return knownVendor }
+        if (knownVendor != null) { pendingSelectedDeviceName = knownVendor.deviceName; diag("DEVICE SELECTED known VID: " + knownVendor.deviceName + " VID=0x" + knownVendor.vendorId.toString(16) + " PID=0x" + knownVendor.productId.toString(16)); return knownVendor }
 
         // 2. Check standard CDC-ECM / CDC-NCM USB class at device or interface level
         val cdcDevice = list.firstOrNull { device ->
@@ -366,7 +374,7 @@ class UsbEthernetManager(private val context: Context) {
             }
             false
         }
-        if (cdcDevice != null) diag("DEVICE SELECTED CDC: " + cdcDevice.deviceName + " VID=0x" + cdcDevice.vendorId.toString(16) + " PID=0x" + cdcDevice.productId.toString(16)) else diag("DEVICE SELECTION FAILED: no known vendor or CDC ECM/NCM candidate", true)
+        if (cdcDevice != null) { pendingSelectedDeviceName = cdcDevice.deviceName; diag("DEVICE SELECTED CDC: " + cdcDevice.deviceName + " VID=0x" + cdcDevice.vendorId.toString(16) + " PID=0x" + cdcDevice.productId.toString(16)) } else diag("DEVICE SELECTION FAILED: no known vendor or CDC ECM/NCM candidate", true)
         return cdcDevice
     }
 
