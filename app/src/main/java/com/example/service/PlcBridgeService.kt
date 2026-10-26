@@ -53,7 +53,11 @@ class PlcBridgeService : Service() {
     companion object {
         const val NOTIFICATION_ID = 1001
         const val ACTION_START = "com.example.service.action.START"
+        const val ACTION_CONNECT_TAILSCALE = "com.example.service.action.CONNECT_TAILSCALE"
         const val ACTION_STOP = "com.example.service.action.STOP"
+        const val EXTRA_AUTH_KEY = "com.example.service.extra.AUTH_KEY"
+        const val EXTRA_NODE_NAME = "com.example.service.extra.NODE_NAME"
+        const val EXTRA_ADVERTISED_ROUTES = "com.example.service.extra.ADVERTISED_ROUTES"
         private const val TAG = "PlcBridgeService"
 
         @Volatile
@@ -142,6 +146,14 @@ class PlcBridgeService : Service() {
             ACTION_START -> {
                 startForegroundNotification()
                 startBridge()
+            }
+            ACTION_CONNECT_TAILSCALE -> {
+                startForegroundNotification()
+                tailscaleManager.startSubnetRouter(
+                    intent?.getStringExtra(EXTRA_AUTH_KEY).orEmpty(),
+                    intent?.getStringExtra(EXTRA_NODE_NAME).orEmpty().ifBlank { "galaxy-s9-plc-bridge" },
+                    intent?.getStringExtra(EXTRA_ADVERTISED_ROUTES).orEmpty().ifBlank { "192.168.1.0/24" }
+                )
             }
             ACTION_STOP -> {
                 stopBridge()
@@ -305,7 +317,7 @@ class PlcBridgeService : Service() {
                 sendGratuitousArp()
             } catch (e: CancellationException) {
                 usbManager.disconnect()
-                tailscaleManager.stopSubnetRouter()
+                // Runtime ownership belongs to the service; only explicit ACTION_STOP tears it down.
                 throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Bridge startup failed", e)
@@ -313,8 +325,7 @@ class PlcBridgeService : Service() {
                 rxJob?.cancel()
                 statsJob?.cancel()
                 usbManager.disconnect()
-                tailscaleManager.stopSubnetRouter()
-
+                // A failed USB/bridge attempt must not stop a separately running Tailscale session.
                 _bridgeState.value = BridgeState.ERROR
             }
         }

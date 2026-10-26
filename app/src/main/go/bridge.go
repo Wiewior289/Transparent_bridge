@@ -98,13 +98,14 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/tailscale/wireguard-go/tun" // Nagłówki tun.Device (Vector Packet Processing)
 	"tailscale.com/control/controlclient"  // Definicja flag logowania i stanów kontrolnych
 	"tailscale.com/ipn"                     // Obiekt preferencji ipn.NewPrefs / AdvertiseRoutes
 	"tailscale.com/ipn/ipnlocal"            // Serce demona: menedżer ipnlocal.NewLocalBackend
-	"tailscale.com/ipn/store/mem"           // Inicjalizacja bazy stanów w pamięci RAM
+	"tailscale.com/ipn/store"                // Persistent Tailscale state store
 	"tailscale.com/net/netmon"              // Android interface provider for SDK 30+
 	"tailscale.com/net/tsdial"              // Dialer wychodzący do połączeń sieciowych
 	"tailscale.com/tsd"                     // Struktura systemowa tsd.System (kontener silnika)
@@ -309,11 +310,18 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz
 	}
 	bridgeLogf("startup: TS_LOGS_DIR configured to app-private directory %q", logsDir)
 
+	stateFile := filepath.Join(dataDir, "tailscaled.state")
+	stateStore, err := store.New(bridgeLogf, stateFile)
+	if err != nil {
+		bridgeLogf("startup: open Tailscale state store failed: %v", err)
+		return -5
+	}
+	bridgeLogf("startup: persistent Tailscale state store opened; path=%q", stateFile)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	uTun := NewUserlandTun(ctx)
 
 	sys := new(tsd.System)
-	stateStore := new(mem.Store)
 	sys.StateStore.Set(stateStore)
 	bridgeLogf("startup: runtime allocated; registering Android netmon interface getter")
 	netmon.RegisterInterfaceGetter(androidInterfaceGetter)
@@ -347,14 +355,19 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz
 		bridgeLogf,
 		logid.PublicID{},
 		sys,
-		controlclient.LoginFlags(0),
+		controlclient.LoginDefault | controlclient.LocalBackendStartKeyOSNeutral,
 	)
 	if err != nil {
 		bridgeLogf("startup: NewLocalBackend failed: %v", err)
 		eng.Close()
+		dialer.Close()
+		uTun.Close()
 		cancel()
 		return -2
 }
+
+	lb.SetVarRoot(dataDir)
+	bridgeLogf("startup: LocalBackend var root set to app-private directory")
 
 	prefs := ipn.NewPrefs()
 	prefs.WantRunning = true
@@ -364,16 +377,34 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz
 		prefs.AdvertiseRoutes = []netip.Prefix{prefix}
 	}
 
-	bridgeLogf("startup: LocalBackend.Start begin; auth key present=%t, routes=%s", authKey != "", routesStr)
+	bridgeLogf("startup: LocalBackend.Start begin; auth key present=%t length=%d, routes=%s", authKey != "", len(authKey), routesStr)
+	if authKey == "" {
+		bridgeLogf("startup: rejected empty AuthKey before LocalBackend.Start")
+		lb.Shutdown()
+		eng.Close()
+		dialer.Close()
+		uTun.Close()
+		cancel()
+		return -6
+	}
 	if err := lb.Start(ipn.Options{AuthKey: authKey, UpdatePrefs: prefs}); err != nil {
 		bridgeLogf("startup: LocalBackend.Start failed: %v", err)
 		lb.Shutdown()
+		eng.Close()
 		dialer.Close()
+		uTun.Close()
 		cancel()
 		return -3
 	}
 
-	bridgeLogf("startup: LocalBackend.Start returned successfully")
+	initialState := lb.State()
+	bridgeLogf("auth: LocalBackend.Start returned; state=%v; auth key present=%t length=%d", initialState, authKey != "", len(authKey))
+	if initialState == ipn.NeedsLogin {
+		bridgeLogf("auth: state is NeedsLogin; invoking tsnet-compatible StartLoginInteractive")
+		if err := lb.StartLoginInteractive(ctx); err != nil {
+			bridgeLogf("auth: StartLoginInteractive returned error: %v", err)
+		}
+	}
 	globalBridge = &TailscaleL3Bridge{
 		backend: lb,
 		dialer:  dialer,
@@ -382,6 +413,7 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz
 		ctx:     ctx,
 		cancel:  cancel,
 	}
+	go watchBackendState(ctx, lb)
 
 	return 1
 }
@@ -447,6 +479,40 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_stopTsnet(env *C.JNIEnv, thiz 
 	globalStopping = false
 	globalMu.Unlock()
 	return 1
+}
+
+//export Java_com_example_core_vpn_TailscaleBridgeJni_getBackendState
+func Java_com_example_core_vpn_TailscaleBridgeJni_getBackendState(env *C.JNIEnv, thiz C.jobject) C.jstring {
+	globalMu.RLock()
+	state := "STOPPED"
+	if bridge := globalBridge; bridge != nil && bridge.running {
+		state = fmt.Sprintf("%v", bridge.backend.State())
+	}
+	globalMu.RUnlock()
+
+	cState := C.CString(state)
+	defer C.free(unsafe.Pointer(cState))
+	return C.jstring(C.cgoNewStringUTF(env, cState))
+}
+
+func watchBackendState(ctx context.Context, lb *ipnlocal.LocalBackend) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	lastState := fmt.Sprintf("%v", lb.State())
+	bridgeLogf("state: observer started; LocalBackend state=%s", lastState)
+	for {
+		select {
+		case <-ctx.Done():
+			bridgeLogf("state: observer stopped")
+			return
+		case <-ticker.C:
+			state := fmt.Sprintf("%v", lb.State())
+			if state != lastState {
+				bridgeLogf("state: LocalBackend transition %s -> %s", lastState, state)
+				lastState = state
+			}
+		}
+	}
 }
 
 //export Java_com_example_core_vpn_TailscaleBridgeJni_getAssignedTailnetIp

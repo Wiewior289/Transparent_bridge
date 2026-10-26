@@ -197,7 +197,13 @@ class PlcBridgeViewModel(application: Application) : AndroidViewModel(applicatio
             nodeName = nodeName,
             advertisedRoutes = routes
         )
-        bridgeService?.tailscaleManager?.startSubnetRouter(authKey, nodeName, routes)
+        val intent = Intent(context, PlcBridgeService::class.java).apply {
+            action = PlcBridgeService.ACTION_CONNECT_TAILSCALE
+            putExtra(PlcBridgeService.EXTRA_AUTH_KEY, authKey)
+            putExtra(PlcBridgeService.EXTRA_NODE_NAME, nodeName)
+            putExtra(PlcBridgeService.EXTRA_ADVERTISED_ROUTES, routes)
+        }
+        androidx.core.content.ContextCompat.startForegroundService(context, intent)
     }
 
     fun applyProfile(profile: PlcProfile) {
