@@ -120,6 +120,10 @@ class PlcBridgeService : Service() {
         super.onCreate()
         instance = this
         usbManager = UsbEthernetManager(this)
+        // Mirror structured USB diagnostics into the existing in-app Console tab.
+        usbManager.diagnosticListener = { line ->
+            logPacket("USB", "USB-HOST", "USB-DEVICE", 0, line, "", false)
+        }
         arpEngine = ArpEngine(
             virtualMac = ArpEngine.parseMac(ethernetConfig.virtualMac),
             adapterIp = ArpEngine.parseIp(ethernetConfig.adapterIp)

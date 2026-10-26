@@ -89,14 +89,14 @@ fun ConsoleScreen(viewModel: PlcBridgeViewModel) {
         ) {
             Column {
                 Text(
-                    text = "LIVE PACKET INSPECTOR",
+                    text = "LIVE PACKET / USB DIAGNOSTICS",
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
                     color = IndustrialCyan,
                     letterSpacing = 1.sp
                 )
                 Text(
-                    text = "Raw Frame & Stream Monitor",
+                    text = "USB enumeration, ownership & frame monitor",
                     fontSize = 18.sp,
                     fontWeight = FontWeight.ExtraBold,
                     color = TextPrimary
@@ -126,7 +126,7 @@ fun ConsoleScreen(viewModel: PlcBridgeViewModel) {
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            listOf("ALL", "TCP", "ARP", "FTPS", "CLAMPED").forEach { filter ->
+            listOf("ALL", "USB", "TCP", "ARP", "FTPS", "CLAMPED").forEach { filter ->
                 FilterChip(
                     selected = selectedFilter == filter,
                     onClick = { viewModel.setFilter(filter) },
