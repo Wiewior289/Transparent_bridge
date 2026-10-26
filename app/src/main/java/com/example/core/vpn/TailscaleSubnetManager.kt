@@ -88,7 +88,10 @@ class TailscaleSubnetManager(private val context: Context? = null) {
         if (TailscaleBridgeJni.isLibraryLoaded) {
             try {
                 log("Calling TailscaleBridgeJni.startTsnet() in Go runtime...")
-                val res = TailscaleBridgeJni.startTsnet(trimmedKey, nodeName, routes, "")
+                val logStateBaseDir = context?.filesDir?.absolutePath
+                    ?: throw IllegalStateException("Android app files directory is unavailable for Tailscale log state")
+                log("Using app-private Tailscale log state directory: $logStateBaseDir/tailscale-logs")
+                val res = TailscaleBridgeJni.startTsnet(trimmedKey, nodeName, routes, logStateBaseDir)
                 if (res > 0) {
                     val tailnetIp = TailscaleBridgeJni.getAssignedTailnetIp()
                     val hasTailnetIp = tailnetIp != "0.0.0.0" && tailnetIp.isNotBlank()

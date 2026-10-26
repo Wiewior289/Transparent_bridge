@@ -96,6 +96,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"sync"
 	"unsafe"
 
@@ -263,7 +264,7 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_registerPacketListener(env *C.
 }
 
 //export Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet
-func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz C.jobject, jAuthKey, jNodeName, jRoutes, _ C.jstring) C.jint {
+func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz C.jobject, jAuthKey, jNodeName, jRoutes, jDataDir C.jstring) C.jint {
 	globalMu.Lock()
 	defer globalMu.Unlock()
 
@@ -286,6 +287,27 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz
 	C.jniReleaseString(env, jAuthKey, cAuthKey)
 	C.jniReleaseString(env, jNodeName, cNodeName)
 	C.jniReleaseString(env, jRoutes, cRoutes)
+	cDataDir := C.jniGetString(env, jDataDir)
+	dataDir := C.GoString(cDataDir)
+	C.jniReleaseString(env, jDataDir, cDataDir)
+
+	// Tailscale logpolicy needs a writable, stable directory for log identity
+	// state. Android may not provide a usable default temp/cache directory to
+	// this embedded process; otherwise NewLocalBackend can panic in LogsDir().
+	if dataDir == "" {
+		bridgeLogf("startup: app dataDir is empty; cannot safely initialize Tailscale log state")
+		return -5
+	}
+	logsDir := filepath.Join(dataDir, "tailscale-logs")
+	if err := os.MkdirAll(logsDir, 0700); err != nil {
+		bridgeLogf("startup: create Tailscale log state directory %q failed: %v", logsDir, err)
+		return -5
+	}
+	if err := os.Setenv("TS_LOGS_DIR", logsDir); err != nil {
+		bridgeLogf("startup: set TS_LOGS_DIR failed: %v", err)
+		return -5
+	}
+	bridgeLogf("startup: TS_LOGS_DIR configured to app-private directory %q", logsDir)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	uTun := NewUserlandTun(ctx)
