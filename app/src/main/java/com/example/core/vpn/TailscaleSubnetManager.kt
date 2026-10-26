@@ -60,7 +60,6 @@ class TailscaleSubnetManager(private val context: Context? = null) {
      */
     fun startSubnetRouter(authKey: String, nodeName: String, routes: String) {
         val trimmedKey = authKey.trim().ifEmpty { prefs?.getString("auth_key", "") ?: "" }
-        val dataDir = context?.filesDir?.absolutePath ?: "/data/data/com.aistudio.plcbridge.vpexth/files"
 
         prefs?.edit()
             ?.putString("node_name", nodeName)
@@ -71,12 +70,14 @@ class TailscaleSubnetManager(private val context: Context? = null) {
         log("══════════════════════════════════════════════")
         log("Invoking native Go tsnet daemon (bridge.go) via JNI...")
         log("Node: $nodeName | Subnet: $routes")
-        log("Data directory: $dataDir")
 
         _config.value = _config.value.copy(
             nodeName = nodeName,
             advertisedRoutes = routes,
-            authKey = trimmedKey
+            authKey = trimmedKey,
+            isConnected = false,
+            isSubnetRoutingActive = false,
+            tailnetIp = "0.0.0.0"
         )
 
         if (trimmedKey.isEmpty()) {
@@ -87,24 +88,44 @@ class TailscaleSubnetManager(private val context: Context? = null) {
         if (TailscaleBridgeJni.isLibraryLoaded) {
             try {
                 log("Calling TailscaleBridgeJni.startTsnet() in Go runtime...")
-                val res = TailscaleBridgeJni.startTsnet(trimmedKey, nodeName, routes, dataDir)
+                val res = TailscaleBridgeJni.startTsnet(trimmedKey, nodeName, routes, "")
                 if (res > 0) {
                     val tailnetIp = TailscaleBridgeJni.getAssignedTailnetIp()
+                    val hasTailnetIp = tailnetIp != "0.0.0.0" && tailnetIp.isNotBlank()
                     _config.value = _config.value.copy(
-                        isConnected = true,
+                        isConnected = hasTailnetIp,
                         tailnetIp = tailnetIp,
-                        isSubnetRoutingActive = true
+                        isSubnetRoutingActive = hasTailnetIp
                     )
-                    log("SUCCESS: tsnet.Server running in RAM via gVisor netstack!")
-                    log("Assigned Tailnet IP: $tailnetIp")
+                    if (hasTailnetIp) {
+                        log("Backend started; assigned Tailnet IP: $tailnetIp")
+                    } else {
+                        log("Backend start returned, but Tailnet IP is not available yet.")
+                    }
                 } else if (res == 0) {
-                    log("tsnet.Server is already running in RAM.")
-                    _config.value = _config.value.copy(isConnected = true, isSubnetRoutingActive = true)
+                    log("Native Tailscale backend reports it is already running.")
+                    val tailnetIp = TailscaleBridgeJni.getAssignedTailnetIp()
+                    _config.value = _config.value.copy(
+                        isConnected = tailnetIp != "0.0.0.0",
+                        tailnetIp = tailnetIp,
+                        isSubnetRoutingActive = tailnetIp != "0.0.0.0"
+                    )
                 } else {
-                    log("ERROR: tsnet.Server.Start() returned error code $res")
+                    log("ERROR: native Tailscale backend startup failed, code=$res")
+                    _config.value = _config.value.copy(
+                        isConnected = false,
+                        isSubnetRoutingActive = false,
+                        tailnetIp = "0.0.0.0"
+                    )
+                    return
                 }
             } catch (e: UnsatisfiedLinkError) {
                 log("JNI Linkage error: ${e.message}")
+            _config.value = _config.value.copy(
+                isConnected = false,
+                isSubnetRoutingActive = false,
+                tailnetIp = "0.0.0.0"
+            )
             }
         } else {
             log("ERROR: tsnetbridge native library is not loaded; start aborted")
@@ -115,12 +136,10 @@ class TailscaleSubnetManager(private val context: Context? = null) {
             return
         }
 
-        log("══════════════════════════════════════════════")
-        log("REMINDER (Tailscale Admin Console):")
-        log("1. Open https://login.tailscale.com/admin/machines")
-        log("2. Find machine '$nodeName' ➔ Edit route settings")
-        log("3. Approve route '$routes'")
-        log("══════════════════════════════════════════════")
+        if (_config.value.isSubnetRoutingActive) {
+            log("Backend initialization returned successfully. Check the admin console for device registration and approve the advertised route if it appears.")
+            log("Admin console: https://login.tailscale.com/admin/machines")
+        }
     }
 
     /**
