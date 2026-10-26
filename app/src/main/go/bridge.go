@@ -310,7 +310,7 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz
 		},
 	)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "NewUserspaceEngine failed: %v\n", err)
+		bridgeLogf("startup: NewUserspaceEngine failed: %v", err)
 		uTun.Close()
 		dialer.Close()
 		cancel()
