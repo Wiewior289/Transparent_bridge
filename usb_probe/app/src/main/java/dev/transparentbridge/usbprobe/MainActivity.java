@@ -146,9 +146,9 @@ public final class MainActivity extends Activity {
         deviceAdapter.clear();
         for (UsbDevice device : found.values()) {
             devices.add(device);
-            String row = String.format("%04X:%04X bus=%d dev=%d %s",
+            String row = String.format("%04X:%04X deviceId=%d %s",
                     device.getVendorId(), device.getProductId(),
-                    device.getDeviceId(), device.getDeviceId(), device.getDeviceName());
+                    device.getDeviceId(), device.getDeviceName());
             deviceAdapter.add(row);
             log("DISCOVER " + describe(device));
             dumpDescriptors(device);
