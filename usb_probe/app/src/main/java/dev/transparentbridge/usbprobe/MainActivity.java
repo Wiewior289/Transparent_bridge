@@ -40,6 +40,8 @@ public final class MainActivity extends Activity {
     private UsbDevice activeDevice;
     private UsbInterface claimedInterface;
     private Spinner deviceSpinner;
+    private Spinner interfaceSpinner;
+    private final List<UsbInterface> interfaces = new ArrayList<>();
     private ArrayAdapter<String> deviceAdapter;
     private final List<UsbDevice> devices = new ArrayList<>();
     private TextView output;
@@ -116,7 +118,16 @@ public final class MainActivity extends Activity {
 
         addButton(root, "Refresh USB", v -> refreshDevices());
         addButton(root, "Open selected / request permission", v -> requestSelectedDevice());
-        claimButton = addButton(root, "Claim data interface (force=true)", v -> claimDataInterface());
+
+        TextView interfaceLabel = new TextView(this);
+        interfaceLabel.setText("Interface descriptor (index / ID / alternate setting)");
+        root.addView(interfaceLabel);
+        interfaceSpinner = new Spinner(this);
+        interfaceSpinner.setAdapter(new ArrayAdapter<String>(this,
+                android.R.layout.simple_spinner_dropdown_item, new ArrayList<>()));
+        root.addView(interfaceSpinner);
+
+        claimButton = addButton(root, "Claim SELECTED interface (force=true)", v -> claimSelectedInterface());
         releaseButton = addButton(root, "Release / close", v -> closeConnection("manual release"));
         addButton(root, "Snapshot network interfaces", v -> logNetworkInterfaces());
         addButton(root, "Clear log", v -> output.setText(""));
@@ -188,8 +199,28 @@ public final class MainActivity extends Activity {
         activeDevice = device;
         log("OPEN OK fd=" + opened.getFileDescriptor() + " device=" + describe(device));
         dumpDescriptors(device);
+        populateInterfaceChoices(device);
         logNetworkInterfaces();
         updateButtons();
+    }
+
+    private void populateInterfaceChoices(UsbDevice device) {
+        interfaces.clear();
+        @SuppressWarnings("unchecked")
+        ArrayAdapter<String> adapter = (ArrayAdapter<String>) interfaceSpinner.getAdapter();
+        adapter.clear();
+        for (int i = 0; i < device.getInterfaceCount(); i++) {
+            UsbInterface intf = device.getInterface(i);
+            interfaces.add(intf);
+            String row = String.format("index=%d id=%d alt=%d class=0x%s eps=%d", i,
+                    intf.getId(), intf.getAlternateSetting(), hex(intf.getInterfaceClass()),
+                    intf.getEndpointCount());
+            adapter.add(row);
+        }
+        adapter.notifyDataSetChanged();
+        if (!interfaces.isEmpty()) interfaceSpinner.setSelection(0);
+        log("INTERFACE_CHOICES count=" + interfaces.size()
+                + " (select exact descriptor before claim; no automatic guess)");
     }
 
     private void dumpDescriptors(UsbDevice device) {
@@ -214,38 +245,41 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void claimDataInterface() {
+    private void claimSelectedInterface() {
         if (connection == null || activeDevice == null) {
             log("CLAIM skipped: open a device first");
             return;
         }
         if (claimedInterface != null) {
             log("CLAIM skipped: interface already held id=" + claimedInterface.getId()
-                    + " alt=" + claimedInterface.getAlternateSetting());
+                    + "/alt" + claimedInterface.getAlternateSetting()
+                    + "; release before trying another");
             return;
         }
-        UsbInterface candidate = null;
-        for (int i = 0; i < activeDevice.getInterfaceCount(); i++) {
-            UsbInterface intf = activeDevice.getInterface(i);
-            boolean bulkIn = false;
-            boolean bulkOut = false;
-            for (int j = 0; j < intf.getEndpointCount(); j++) {
-                UsbEndpoint ep = intf.getEndpoint(j);
-                if (ep.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK) {
-                    if (ep.getDirection() == UsbConstants.USB_DIR_IN) bulkIn = true;
-                    if (ep.getDirection() == UsbConstants.USB_DIR_OUT) bulkOut = true;
-                }
-            }
-            if (bulkIn && bulkOut) {
-                candidate = intf;
-                break;
-            }
-        }
-        if (candidate == null) {
-            log("CLAIM FAILED: no interface exposes both bulk IN and bulk OUT endpoints");
+        int pos = interfaceSpinner.getSelectedItemPosition();
+        if (pos < 0 || pos >= interfaces.size()) {
+            log("CLAIM skipped: select an interface descriptor first");
             return;
         }
-        log("CLAIM attempt id=" + candidate.getId() + " alt=" + candidate.getAlternateSetting()
+
+        UsbInterface candidate = interfaces.get(pos);
+        StringBuilder eps = new StringBuilder();
+        boolean bulkIn = false;
+        boolean bulkOut = false;
+        for (int j = 0; j < candidate.getEndpointCount(); j++) {
+            UsbEndpoint ep = candidate.getEndpoint(j);
+            if (eps.length() > 0) eps.append(",");
+            eps.append("0x").append(hex(ep.getAddress())).append("/")
+                    .append(transferType(ep.getType()));
+            if (ep.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                if (ep.getDirection() == UsbConstants.USB_DIR_IN) bulkIn = true;
+                if (ep.getDirection() == UsbConstants.USB_DIR_OUT) bulkOut = true;
+            }
+        }
+        log("CLAIM attempt descriptorIndex=" + pos + " id=" + candidate.getId()
+                + " alt=" + candidate.getAlternateSetting()
+                + " class=0x" + hex(candidate.getInterfaceClass())
+                + " endpoints=[" + eps + "] bulkIn=" + bulkIn + " bulkOut=" + bulkOut
                 + " force=true");
         boolean ok = connection.claimInterface(candidate, true);
         log("CLAIM result=" + ok);
@@ -258,6 +292,7 @@ public final class MainActivity extends Activity {
         } else {
             log("SET_INTERFACE skipped: selected alternate setting is 0");
         }
+        log("CLAIM NOTE: success proves interface claim only; no USB payload transfer was attempted");
         logNetworkInterfaces();
         updateButtons();
     }
@@ -280,6 +315,10 @@ public final class MainActivity extends Activity {
         connection = null;
         activeDevice = null;
         claimedInterface = null;
+        interfaces.clear();
+        if (interfaceSpinner != null && interfaceSpinner.getAdapter() != null) {
+            ((ArrayAdapter<?>) interfaceSpinner.getAdapter()).clear();
+        }
         updateButtons();
         logNetworkInterfaces();
     }
@@ -336,7 +375,7 @@ public final class MainActivity extends Activity {
     }
 
     private void updateButtons() {
-        if (claimButton != null) claimButton.setEnabled(connection != null && claimedInterface == null);
+        if (claimButton != null) claimButton.setEnabled(connection != null && claimedInterface == null && !interfaces.isEmpty());
         if (releaseButton != null) releaseButton.setEnabled(connection != null);
     }
 
