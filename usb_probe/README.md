@@ -10,10 +10,10 @@ Izolować zachowanie Androidowego USB Host API bez Tailscale, VPN/TUN, Go, routi
 
 1. Wykrywa urządzenia USB i żąda zgody przez `UsbManager`.
 2. Otwiera urządzenie przez `UsbDeviceConnection`.
-3. Loguje konfiguracje, interfejsy, alternate settings i endpointy.
+3. Loguje każdą konfigurację osobno: ID, nazwę, liczbę interfejsów, max power, self-powered, remote wakeup, a następnie interfejsy i endpointy. Dodatkowo loguje spłaszczoną listę `UsbDevice` używaną przez selektor.
 4. Pokazuje osobny wybór konkretnego deskryptora interfejsu: indeks z listy Android API, ID, alternate setting, klasę i endpointy.
 5. Próbuje `claimInterface(wybranyInterfejs, true)` bez automatycznego wybierania pierwszego pasującego interfejsu.
-6. Jeżeli wybrany interfejs ma alternate setting != 0, próbuje `setInterface()`.
+6. Oddziela `claimInterface()` od `setInterface()`: po Claim nie wykonuje automatycznie `setInterface()`. Drugi przycisk wywołuje `setInterface()` jawnie dla przejętego deskryptora, tylko gdy `alt != 0`, dzięki czemu oba wyniki można porównać niezależnie.
 7. Trzyma połączenie i interfejs zajęte aż do ręcznego zwolnienia lub zamknięcia aplikacji.
 8. Loguje stan widocznych interfejsów JVM oraz zdarzenia USB attach/detach.
 
@@ -49,6 +49,8 @@ Zapisuj dokładny model adaptera, Android build, godzinę zdarzenia oraz logi ap
 ## Ważne ograniczenia
 
 - Sukces `claimInterface()` nie dowodzi działania transmisji Ethernet ani trwałego odłączenia sterownika jądra.
+- Enumeracja konfiguracji jest tylko odczytem. Aplikacja celowo nie wywołuje `setConfiguration()` i nie zakłada, że wie, która konfiguracja jest aktywna.
+- `setInterface()` jest osobnym, ręcznym pomiarem. Nie wysyłamy losowych `controlTransfer()` i nie próbujemy sztucznie przejmować/zwalniać interfejsu kontrolnego jako rzekomego sygnału HANGUP.
 - Aplikacja nie używa ukrytych API, roota, sysfs ani `/dev/bus/usb`.
 - Nie zmienia konfiguracji IP, routingu ani firewall.
 - Ten etap celowo nie integruje libusb. Integracja FD/libusb będzie osobnym eksperymentem po zebraniu wyniku bazowego.
