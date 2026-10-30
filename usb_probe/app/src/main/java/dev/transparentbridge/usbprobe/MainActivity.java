@@ -7,6 +7,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.hardware.usb.UsbConstants;
+import android.hardware.usb.UsbConfiguration;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbEndpoint;
@@ -46,6 +47,7 @@ public final class MainActivity extends Activity {
     private final List<UsbDevice> devices = new ArrayList<>();
     private TextView output;
     private Button claimButton;
+    private Button setInterfaceButton;
     private Button releaseButton;
     private boolean receiverRegistered = false;
 
@@ -128,6 +130,7 @@ public final class MainActivity extends Activity {
         root.addView(interfaceSpinner);
 
         claimButton = addButton(root, "Claim SELECTED interface (force=true)", v -> claimSelectedInterface());
+        setInterfaceButton = addButton(root, "Set alternate setting on CLAIMED interface", v -> setClaimedAlternateSetting());
         releaseButton = addButton(root, "Release / close", v -> closeConnection("manual release"));
         addButton(root, "Snapshot network interfaces", v -> logNetworkInterfaces());
         addButton(root, "Clear log", v -> output.setText(""));
@@ -225,23 +228,46 @@ public final class MainActivity extends Activity {
 
     private void dumpDescriptors(UsbDevice device) {
         log("DEVICE " + describe(device) + " configurations=" + device.getConfigurationCount()
-                + " interfaces=" + device.getInterfaceCount());
+                + " apiInterfaces=" + device.getInterfaceCount());
+        log("CONFIG NOTE: enumerate all configurations; this diagnostic does NOT call setConfiguration().");
+        for (int c = 0; c < device.getConfigurationCount(); c++) {
+            UsbConfiguration config = device.getConfiguration(c);
+            log(" CONFIG index=" + c + " id=" + config.getId()
+                    + " name=" + config.getName()
+                    + " interfaces=" + config.getInterfaceCount()
+                    + " maxPowerMilliAmps=" + config.getMaxPower()
+                    + " selfPowered=" + config.isSelfPowered()
+                    + " remoteWakeup=" + config.isRemoteWakeup());
+            for (int i = 0; i < config.getInterfaceCount(); i++) {
+                UsbInterface intf = config.getInterface(i);
+                logInterfaceDescriptor("CONFIG[" + c + "].IF[" + i + "]", intf);
+            }
+        }
+
+        // UsbDevice's flattened interface list is what the current selection UI uses.
+        // Keep it separate from configuration-indexed enumeration to avoid implying that
+        // public UsbDeviceConnection exposes which configuration is currently active.
         for (int i = 0; i < device.getInterfaceCount(); i++) {
             UsbInterface intf = device.getInterface(i);
-            log(" IF index=" + i + " id=" + intf.getId()
-                    + " alt=" + intf.getAlternateSetting()
-                    + " class=0x" + hex(intf.getInterfaceClass())
-                    + " subclass=0x" + hex(intf.getInterfaceSubclass())
-                    + " protocol=0x" + hex(intf.getInterfaceProtocol())
-                    + " endpoints=" + intf.getEndpointCount());
-            for (int j = 0; j < intf.getEndpointCount(); j++) {
-                UsbEndpoint ep = intf.getEndpoint(j);
-                log("  EP address=0x" + hex(ep.getAddress())
-                        + " dir=" + (ep.getDirection() == UsbConstants.USB_DIR_IN ? "IN" : "OUT")
-                        + " type=" + transferType(ep.getType())
-                        + " maxPacket=" + ep.getMaxPacketSize()
-                        + " interval=" + ep.getInterval());
-            }
+            logInterfaceDescriptor("API_FLAT[" + i + "]", intf);
+        }
+        log("CONFIG LIMIT: active configuration is not queried or changed by this probe; compare config grouping with API_FLAT entries.");
+    }
+
+    private void logInterfaceDescriptor(String prefix, UsbInterface intf) {
+        log(" " + prefix + " id=" + intf.getId()
+                + " alt=" + intf.getAlternateSetting()
+                + " class=0x" + hex(intf.getInterfaceClass())
+                + " subclass=0x" + hex(intf.getInterfaceSubclass())
+                + " protocol=0x" + hex(intf.getInterfaceProtocol())
+                + " endpoints=" + intf.getEndpointCount());
+        for (int j = 0; j < intf.getEndpointCount(); j++) {
+            UsbEndpoint ep = intf.getEndpoint(j);
+            log("  EP address=0x" + hex(ep.getAddress())
+                    + " dir=" + (ep.getDirection() == UsbConstants.USB_DIR_IN ? "IN" : "OUT")
+                    + " type=" + transferType(ep.getType())
+                    + " maxPacket=" + ep.getMaxPacketSize()
+                    + " interval=" + ep.getInterval());
         }
     }
 
@@ -286,13 +312,27 @@ public final class MainActivity extends Activity {
         if (!ok) return;
 
         claimedInterface = candidate;
-        if (candidate.getAlternateSetting() != 0) {
-            boolean set = connection.setInterface(candidate);
-            log("SET_INTERFACE alt=" + candidate.getAlternateSetting() + " result=" + set);
-        } else {
-            log("SET_INTERFACE skipped: selected alternate setting is 0");
-        }
+        log("CLAIM NOTE: setInterface is deliberately a separate manual step; no alternate-setting call was made by CLAIM.");
         log("CLAIM NOTE: success proves interface claim only; no USB payload transfer was attempted");
+        logNetworkInterfaces();
+        updateButtons();
+    }
+
+    private void setClaimedAlternateSetting() {
+        if (connection == null || activeDevice == null || claimedInterface == null) {
+            log("SET_INTERFACE skipped: open device and claim an interface first");
+            return;
+        }
+        int alt = claimedInterface.getAlternateSetting();
+        log("SET_INTERFACE attempt id=" + claimedInterface.getId() + " alt=" + alt
+                + " class=0x" + hex(claimedInterface.getInterfaceClass()));
+        if (alt == 0) {
+            log("SET_INTERFACE skipped: selected claimed descriptor has alt=0; no implicit reset is attempted");
+            return;
+        }
+        boolean ok = connection.setInterface(claimedInterface);
+        log("SET_INTERFACE result=" + ok + " id=" + claimedInterface.getId() + " alt=" + alt);
+        log("SET_INTERFACE NOTE: this result is separate from CLAIM; no USB payload transfer was attempted");
         logNetworkInterfaces();
         updateButtons();
     }
@@ -376,6 +416,7 @@ public final class MainActivity extends Activity {
 
     private void updateButtons() {
         if (claimButton != null) claimButton.setEnabled(connection != null && claimedInterface == null && !interfaces.isEmpty());
+        if (setInterfaceButton != null) setInterfaceButton.setEnabled(connection != null && claimedInterface != null && claimedInterface.getAlternateSetting() != 0);
         if (releaseButton != null) releaseButton.setEnabled(connection != null);
     }
 
