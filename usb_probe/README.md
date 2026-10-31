@@ -23,16 +23,16 @@ Izolować zachowanie Androidowego USB Host API bez Tailscale, VPN/TUN, Go, routi
 
 ## Uruchomienie
 
-Z katalogu głównego repozytorium:
+Z katalogu głównego repozytorium, przy zainstalowanym Gradle 8.11.1:
 
 ```bash
-./gradlew -p usb_probe assembleDebug
+gradle -p usb_probe assembleDebug --no-configuration-cache
 ```
 
-APK:
-`usb_probe/app/build/outputs/apk/debug/app-debug.apk`
+W tym repozytorium nie ma skryptu `gradlew`, mimo obecności `gradle/wrapper/gradle-wrapper.properties`. Nie uruchamiaj więc `./gradlew`, dopóki wrapper nie zostanie odtworzony.
 
-Jeżeli wrapper nie obsłuży parametru `-p` w danym środowisku, przejdź do katalogu `usb_probe` i uruchom wrapper z katalogu nadrzędnego z `-p usb_probe`.
+APK:
+`usb_probe/app/build/outputs/apk/debug/app-debug.apk`.
 
 ## Procedura pomiarowa
 
