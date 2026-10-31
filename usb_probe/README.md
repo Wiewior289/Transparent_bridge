@@ -77,3 +77,28 @@ Zapisuj dokładny model adaptera, Android build, godzinę zdarzenia oraz logi ap
 - To potwierdza tylko powodzenie claim. Nie mamy jeszcze porównywalnego testu transferu ani pełnego pomiaru stabilności sterownika dla obu adapterów.
 
 **Nie wybieramy zwycięzcy na podstawie samego claim.** Następny pomiar to porównywalne wyniki bulk IN/OUT na konkretnych deskryptorach. Obsługa wielu modeli i ewentualne handshake powinny później powstać jako jawne profile protokołu, oparte na deskryptorach, dokumentacji i pomiarach, a nie na samym VID:PID.
+
+
+## Kernel CDC recovery (WCH 1A86:5394)
+
+The **Restore kernel cdc_ether (root)** action is a recovery/diagnostic path, not the normal bulk-transfer path.
+
+1. Stop any active transfer. The action closes the app's `UsbDeviceConnection`.
+2. Android displays the root-manager authorization prompt if `su` is available.
+3. The command inspects `/sys/bus/usb/devices` for VID:PID `1a86:5394`, then checks the control interface `:2.0` and data interface `:2.1`.
+4. If both interfaces already show `cdc_ether`, it reports that the driver is already bound. If the control interface is unbound, it tries to bind `cdc_ether`. If the control interface is already bound but the data interface is not, it tries a control-interface unbind/bind cycle to make the CDC driver probe again. It refuses to overwrite a different control-interface driver.
+5. Check the log for `CONTROL_DRIVER_AFTER`, `DATA_DRIVER_AFTER`, and whether `eth0` reappears.
+
+This operation requires a rooted Android build and a kernel exposing the relevant sysfs driver bind files. The USB Host API itself has no public method to bind a kernel driver. The action deliberately does not send undocumented vendor requests and does not touch the main Transparent Bridge app.
+
+Build from the repository root:
+
+```bash
+./gradlew -p usb_probe assembleDebug --no-configuration-cache
+```
+
+Expected APK path:
+
+`usb_probe/app/build/outputs/apk/debug/app-debug.apk`
+
+A successful sysfs bind is not proof of working Ethernet traffic. Confirm that `cdc_ether` is bound, `eth0` exists, the link state is appropriate, and RX/TX counters change during a controlled network test.
