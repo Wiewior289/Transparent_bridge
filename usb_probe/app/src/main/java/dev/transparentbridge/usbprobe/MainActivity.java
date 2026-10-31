@@ -140,6 +140,7 @@ public final class MainActivity extends Activity {
         bulkInButton = addButton(root, "Bulk IN: read once (1500 ms)", v -> runBulkInOnce());
         bulkOutButton = addButton(root, "Bulk OUT: send lab frame (0x88B5)", v -> confirmBulkOut());
         addButton(root, "Snapshot network interfaces", v -> logNetworkInterfaces());
+        addButton(root, "Restore kernel cdc_ether (root)", v -> restoreKernelCdcEther());
         addButton(root, "Clear log", v -> output.setText(""));
 
         ScrollView scroll = new ScrollView(this);
@@ -495,6 +496,84 @@ public final class MainActivity extends Activity {
         long stamp = System.currentTimeMillis();
         for (int i = 0; i < 8; i++) frame[27 + i] = (byte) (stamp >>> (56 - 8 * i));
         return frame;
+    }
+
+    /**
+     * Recover the kernel-owned CDC Ethernet binding after a USB Host claim.
+     *
+     * UsbDeviceConnection has no public API to bind a kernel driver. This
+     * diagnostic action closes our USB file descriptor, then uses an
+     * explicitly granted root shell to inspect sysfs. It only binds/rebinds
+     * the CDC control interface for VID:PID 1A86:5394; it does not claim the
+     * data interface and does not send undocumented vendor control requests.
+     */
+    private void restoreKernelCdcEther() {
+        if (transferBusy.get()) {
+            log("CDC_RESTORE skipped: USB transfer is active");
+            return;
+        }
+
+        final UsbDevice selected = activeDevice;
+        if (selected != null &&
+                (selected.getVendorId() != 0x1A86 || selected.getProductId() != 0x5394)) {
+            log("CDC_RESTORE skipped: selected device is not WCH 1A86:5394");
+            return;
+        }
+
+        closeConnection("prepare kernel cdc_ether restore");
+        log("CDC_RESTORE starting root/sysfs probe for VID:PID 1A86:5394");
+
+        Thread worker = new Thread(() -> {
+            String script =
+                    "set -u; found=0; " +
+                    "for d in /sys/bus/usb/devices/*; do " +
+                    "[ -r $d/idVendor ] || continue; " +
+                    "[ $(cat $d/idVendor 2>/dev/null) = 1a86 ] || continue; " +
+                    "[ $(cat $d/idProduct 2>/dev/null) = 5394 ] || continue; " +
+                    "found=1; dev=${d##*/}; ctrl=$dev:2.0; data=$dev:2.1; " +
+                    "echo DEVICE=$dev; echo CONFIG=$(cat $d/bConfigurationValue 2>/dev/null); " +
+                    "if [ -L $d/$ctrl/driver ]; then cdrv=$(basename $(readlink $d/$ctrl/driver)); else cdrv=none; fi; " +
+                    "if [ -L $d/$data/driver ]; then ddrv=$(basename $(readlink $d/$data/driver)); else ddrv=none; fi; " +
+                    "echo CONTROL_DRIVER=$cdrv; echo DATA_DRIVER=$ddrv; " +
+                    "if [ $cdrv = cdc_ether ] && [ $ddrv = cdc_ether ]; then echo RESULT=already_bound; " +
+                    "elif [ $cdrv = cdc_ether ] && [ $ddrv != cdc_ether ]; then " +
+                    "echo RECOVERY=rebinding_cdc_control; " +
+                    "if echo $ctrl > /sys/bus/usb/drivers/cdc_ether/unbind 2>/dev/null && " +
+                    "echo $ctrl > /sys/bus/usb/drivers/cdc_ether/bind 2>/dev/null; then echo RESULT=rebind_ok; " +
+                    "else echo RESULT=rebind_failed; fi; " +
+                    "elif [ $cdrv = none ]; then " +
+                    "if [ -e /sys/bus/usb/drivers/cdc_ether/bind ] && " +
+                    "echo $ctrl > /sys/bus/usb/drivers/cdc_ether/bind 2>/dev/null; then echo RESULT=bind_ok; " +
+                    "else echo RESULT=bind_failed_or_driver_unavailable; fi; " +
+                    "else echo RESULT=refuse_other_control_driver; fi; " +
+                    "if [ -L $d/$ctrl/driver ]; then echo CONTROL_DRIVER_AFTER=$(basename $(readlink $d/$ctrl/driver)); else echo CONTROL_DRIVER_AFTER=none; fi; " +
+                    "if [ -L $d/$data/driver ]; then echo DATA_DRIVER_AFTER=$(basename $(readlink $d/$data/driver)); else echo DATA_DRIVER_AFTER=none; fi; " +
+                    "done; [ $found = 1 ] || echo RESULT=device_not_found";
+
+            try {
+                Process process = new ProcessBuilder("su", "-c", script)
+                        .redirectErrorStream(true).start();
+                java.io.ByteArrayOutputStream outputBuffer = new java.io.ByteArrayOutputStream();
+                byte[] chunk = new byte[1024];
+                int count;
+                while ((count = process.getInputStream().read(chunk)) != -1) {
+                    outputBuffer.write(chunk, 0, count);
+                }
+                int exitCode = process.waitFor();
+                String result = new String(outputBuffer.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+                runOnUiThread(() -> {
+                    log("CDC_RESTORE su_exit=" + exitCode);
+                    for (String line : result.split("\\r?\\n")) {
+                        if (!line.isEmpty()) log("CDC_RESTORE " + line);
+                    }
+                    logNetworkInterfaces();
+                    refreshDevices();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> log("CDC_RESTORE failed: root shell unavailable or denied: " + e));
+            }
+        }, "UsbProbe-CdcRestore");
+        worker.start();
     }
 
     private void logNetworkInterfaces() {
