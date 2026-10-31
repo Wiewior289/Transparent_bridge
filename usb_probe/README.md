@@ -13,11 +13,13 @@ Izolować zachowanie Androidowego USB Host API bez Tailscale, VPN/TUN, Go, routi
 3. Loguje każdą konfigurację osobno: ID, nazwę, liczbę interfejsów, max power, self-powered, remote wakeup, a następnie interfejsy i endpointy. Dodatkowo loguje spłaszczoną listę `UsbDevice` używaną przez selektor.
 4. Pokazuje osobny wybór konkretnego deskryptora interfejsu: indeks z listy Android API, ID, alternate setting, klasę i endpointy.
 5. Próbuje `claimInterface(wybranyInterfejs, true)` bez automatycznego wybierania pierwszego pasującego interfejsu.
-6. Oddziela `claimInterface()` od `setInterface()`: po Claim nie wykonuje automatycznie `setInterface()`. Drugi przycisk wywołuje `setInterface()` jawnie dla przejętego deskryptora, tylko gdy `alt != 0`, dzięki czemu oba wyniki można porównać niezależnie.
-7. Trzyma połączenie i interfejs zajęte aż do ręcznego zwolnienia lub zamknięcia aplikacji.
-8. Loguje stan widocznych interfejsów JVM oraz zdarzenia USB attach/detach.
+6. Oddziela `claimInterface()` od `setInterface()`: po Claim nie wykonuje automatycznie `setInterface()`.
+7. Dodaje jednorazowy `bulkTransfer()` IN i jednorazowy OUT w wątku roboczym, z timeoutem i logiem czasu/wyniku. Endpoint wybierany jest z przejętego deskryptora, bez hardkodowania adresu endpointu.
+8. Ramka OUT jest wysyłana dopiero po potwierdzeniu w oknie dialogowym; to broadcast i może być widoczny dla innych urządzeń w segmencie.
+9. Trzyma połączenie i interfejs zajęte aż do ręcznego zwolnienia lub zamknięcia aplikacji.
+10. Loguje stan widocznych interfejsów JVM oraz zdarzenia USB attach/detach.
 
-**Nie wysyła ani nie odbiera danych USB.** To celowe: ten etap rozdziela wybór deskryptora i wynik claim od późniejszego testu transferu. Nie wolno interpretować `CLAIM result=true` jako dowodu działającego Ethernetu.
+**Etap 2 dodaje kontrolowane testy transferu bulk.** `Bulk IN` wykonuje pojedynczy odczyt z pierwszego endpointu bulk IN przejętego deskryptora (bufor 4096 B, timeout 1500 ms) w wątku roboczym. `Bulk OUT` po osobnym potwierdzeniu wysyła jedną 60-bajtową ramkę Ethernet broadcast z EtherType `0x88B5`, bez IP/ARP/DHCP. Wysyłaj ją wyłącznie w odizolowanym segmencie testowym. Wynik OUT równy długości ramki oznacza, że Android USB Host API przyjęło bufor, nie że odbiornik ją odebrał. Odczyt `-1` nie rozróżnia timeoutu i błędu USB, bo publiczne API nie udostępnia tu errno.
 
 ## Uruchomienie
 
@@ -38,17 +40,19 @@ Jeżeli wrapper nie obsłuży parametru `-p` w danym środowisku, przejdź do ka
 2. Uruchom aplikację i naciśnij **Refresh USB**.
 3. Podłącz adapter, wybierz urządzenie i udziel zgody.
 4. Zapisz log bazowy: czy Android utworzył `eth0` / `usb0`.
-5. Wybierz konkretny interfejs z drugiej listy. Najpierw testuj deskryptor z bulk IN i bulk OUT, ale osobno porównaj inne deskryptory o tym samym ID i różnym alternate setting.
-6. Naciśnij **Claim SELECTED interface (force=true)**.
-7. Nie zamykaj aplikacji i nie zwalniaj interfejsu przez 60–120 sekund.
-8. Obserwuj, czy interfejs sieciowy znika lub pojawia się ponownie. Równolegle zbierz `logcat` i, jeśli dostępny, `dmesg`.
-9. Naciśnij **Release** i sprawdź, czy systemowy interfejs wraca.
+5. Wybierz konkretny deskryptor. Dla WCH porównaj m.in. `id=1 alt=1 class=0x0A`, który ma bulk IN/OUT.
+6. Naciśnij **Claim SELECTED interface (force=true)**. W razie potrzeby osobno użyj **Set alternate setting**.
+7. Uruchom pojedynczy **Bulk IN** i zapisz wynik. Brak danych lub `-1` nie identyfikuje sam w sobie przyczyny.
+8. Dopiero na odizolowanym segmencie użyj **Bulk OUT** i potwierdź transmisję ramki `0x88B5`.
+9. Obserwuj równolegle `logcat`, a jeśli dostępny, `dmesg`; po testach naciśnij **Release / close**.
 
 Zapisuj dokładny model adaptera, Android build, godzinę zdarzenia oraz logi aplikacji i systemu.
 
 ## Ważne ograniczenia
 
 - Sukces `claimInterface()` nie dowodzi działania transmisji Ethernet ani trwałego odłączenia sterownika jądra.
+- Sukces `bulkTransfer(OUT)` nie jest ACK z adaptera ani potwierdzeniem odbioru ramki po stronie sieci.
+- Aplikacja nie implementuje na tym etapie handshake, CDC control requests ani profili per VID:PID. Nie wysyła losowych żądań sterujących.
 - Enumeracja konfiguracji jest tylko odczytem. Aplikacja celowo nie wywołuje `setConfiguration()` i nie zakłada, że wie, która konfiguracja jest aktywna.
 - `setInterface()` jest osobnym, ręcznym pomiarem. Nie wysyłamy losowych `controlTransfer()` i nie próbujemy sztucznie przejmować/zwalniać interfejsu kontrolnego jako rzekomego sygnału HANGUP.
 - Aplikacja nie używa ukrytych API, roota, sysfs ani `/dev/bus/usb`.
@@ -72,4 +76,4 @@ Zapisuj dokładny model adaptera, Android build, godzinę zdarzenia oraz logi ap
 - Odpowiadające mu endpointy raportowane w tym teście: bulk IN `0x81`, bulk OUT `0x02`, dodatkowo interrupt IN `0x83`.
 - To potwierdza tylko powodzenie claim. Nie mamy jeszcze porównywalnego testu transferu ani pełnego pomiaru stabilności sterownika dla obu adapterów.
 
-**Nie wybieramy zwycięzcy na podstawie samego claim.** Następny etap to powtarzalny test wybranych deskryptorów oraz obserwacja, czy sterownik jądra znika, pozostaje odłączony i wraca po Release. Transfery bulk dodamy dopiero po ustaleniu, który deskryptor rzeczywiście jest właściwy.
+**Nie wybieramy zwycięzcy na podstawie samego claim.** Następny pomiar to porównywalne wyniki bulk IN/OUT na konkretnych deskryptorach. Obsługa wielu modeli i ewentualne handshake powinny później powstać jako jawne profile protokołu, oparte na deskryptorach, dokumentacji i pomiarach, a nie na samym VID:PID.
