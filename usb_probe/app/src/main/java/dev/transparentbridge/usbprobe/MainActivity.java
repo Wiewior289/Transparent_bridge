@@ -551,7 +551,7 @@ public final class MainActivity extends Activity {
     private void updateButtons() {
         if (claimButton != null) claimButton.setEnabled(connection != null && claimedInterface == null && !interfaces.isEmpty());
         if (setInterfaceButton != null) setInterfaceButton.setEnabled(connection != null && claimedInterface != null && claimedInterface.getAlternateSetting() != 0);
-        if (releaseButton != null) releaseButton.setEnabled(connection != null);
+        if (releaseButton != null) releaseButton.setEnabled(connection != null && !transferBusy.get());
         boolean canTransfer = connection != null && claimedInterface != null && !transferBusy.get();
         if (bulkInButton != null) bulkInButton.setEnabled(canTransfer && findBulkEndpoint(claimedInterface, UsbConstants.USB_DIR_IN) != null);
         if (bulkOutButton != null) bulkOutButton.setEnabled(canTransfer && findBulkEndpoint(claimedInterface, UsbConstants.USB_DIR_OUT) != null);
