@@ -4,6 +4,16 @@ on:
   push:
     branches:
       - experiment/cdc-ether-userland-replay
+      - refactor/cdc-ecm-modules
+    paths:
+      - 'usb_probe/**'
+      - 'gradle/**'
+      - 'settings.gradle.kts'
+      - 'build.gradle.kts'
+      - '.github/workflows/build-usb-probe.yml'
+  pull_request:
+    branches:
+      - experiment/cdc-ether-userland-replay
     paths:
       - 'usb_probe/**'
       - 'gradle/**'
