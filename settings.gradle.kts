@@ -24,4 +24,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "PlcBridge"
 
-include(":app")
+include(":app", ":usb_probe")
