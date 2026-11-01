@@ -38,7 +38,6 @@ public final class MainActivity extends Activity {
     private static final int RX_URB_SIZE = 16384;
     private static final int USBNET_DEFAULT_RX_QLEN = 4;
     private static final int RX_QUEUE_DEPTH = 4;
-    private static final int USBNET_DEFAULT_RX_QLEN = 4;
     private static final int TX_QUEUE_DEPTH = 16;
     private static final int USB_CTRL_SET_TIMEOUT = 5000;
 
@@ -65,7 +64,6 @@ public final class MainActivity extends Activity {
     private String macAddress;
     private volatile boolean configured;
     private volatile boolean txRunning;
-    private volatile boolean txWorkerStarted;
     private volatile int rxSubmitted;
     private volatile int rxCompleted;
     private volatile int rxErrors;
@@ -349,36 +347,38 @@ public final class MainActivity extends Activity {
     }
 
     private void startTxWorker() {
-        if (!txWorkerStarted.compareAndSet(false, true)) return;
-        if (txWorkerStarted) return;
-        txWorkerStarted = true;
+        if (!configured || !txWorkerStarted.compareAndSet(false, true)) return;
         txRunning = true;
         txExecutor.execute(() -> {
-            while (txRunning && !Thread.currentThread().isInterrupted()) {
-                try {
-                    byte[] frame = txQueue.poll(500, TimeUnit.MILLISECONDS);
-                    if (frame == null) continue;
-                    UsbDeviceConnection c = connection;
-                    UsbEndpoint endpoint = bulkOut;
-                    if (!configured || c == null || endpoint == null) continue;
-                    byte[] usbPayload = applyUsbnetTxLengthPolicy(frame);
-                    int result = c.bulkTransfer(endpoint, usbPayload, usbPayload.length, 5000);
-                    txSubmitted++;
-                    if (result == usbPayload.length) txCompleted++;
-                    else {
+            try {
+                while (txRunning && !Thread.currentThread().isInterrupted()) {
+                    try {
+                        byte[] frame = txQueue.poll(500, TimeUnit.MILLISECONDS);
+                        if (frame == null) continue;
+                        UsbDeviceConnection c = connection;
+                        UsbEndpoint endpoint = bulkOut;
+                        if (!configured || c == null || endpoint == null) continue;
+                        byte[] usbPayload = applyUsbnetTxLengthPolicy(frame);
+                        int result = c.bulkTransfer(endpoint, usbPayload, usbPayload.length, 5000);
+                        txSubmitted++;
+                        if (result == usbPayload.length) txCompleted++;
+                        else {
+                            txErrors++;
+                            log("TX completion short/error result=" + result + "/" + usbPayload.length);
+                        }
+                        log("TX submit frame=" + frame.length + " USB-transfer=" + usbPayload.length +
+                                " result=" + result + " maxpacket=" + maxPacket +
+                                " policy=" + (usbPayload.length == frame.length ? "unchanged" : "usbnet-pad-byte"));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    } catch (Exception e) {
                         txErrors++;
-                        log("TX completion short/error result=" + result + "/" + usbPayload.length);
+                        log("TX exception: " + e);
                     }
-                    log("TX submit frame=" + frame.length + " USB-transfer=" + usbPayload.length +
-                            " result=" + result + " maxpacket=" + maxPacket +
-                            " policy=" + (usbPayload.length == frame.length ? "unchanged" : "usbnet-pad-byte"));
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                } catch (Exception e) {
-                    txErrors++;
-                    log("TX exception: " + e);
                 }
+            } finally {
+                txWorkerStarted.set(false);
             }
         });
     }
@@ -401,6 +401,8 @@ public final class MainActivity extends Activity {
     private void enqueueLinkTestFrame() {
         if (!configured) { log("TX blocked: CDC bind not complete."); return; }
         byte[] frame = createArpWhoHasFrame();
+        if (frame == null) return;
+        startTxWorker();
         if (!txQueue.offer(frame)) { log("TX queue full; frame not submitted."); return; }
         log("TX queued kernel-style Ethernet ARP who-has frame len=" + frame.length +
                 " sourceMAC=" + macAddress);
@@ -415,7 +417,7 @@ public final class MainActivity extends Activity {
         byte[] source = parseMac(macAddress);
         if (source == null) {
             log("TX blocked: CDC iMACAddress string unavailable/invalid; kernel usbnet_cdc_bind() would fail MAC acquisition.");
-            return;
+            return null;
         }
         byte[] f = new byte[60];
         Arrays.fill(f, 0, 6, (byte)0xFF);
@@ -518,8 +520,7 @@ public final class MainActivity extends Activity {
         rxRunning.set(false);
         txRunning = false;
         txQueue.clear();
-        txWorkerStarted = false;
-        log("Queue stop requested. TX worker stopped; reconfigure USB to restart worker.");
+        log("Queue stop requested. TX worker will exit after any active bulk transfer returns.");
     }
 
     private void closeDevice() {
@@ -527,7 +528,6 @@ public final class MainActivity extends Activity {
         rxRunning.set(false);
         txRunning = false;
         txQueue.clear();
-        txWorkerStarted.set(false);
         UsbDeviceConnection c;
         synchronized (connectionLock) { c = connection; connection = null; }
         if (c != null) {
