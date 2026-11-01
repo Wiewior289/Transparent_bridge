@@ -29,8 +29,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class MainActivity extends Activity {
     private static final String ACTION_PERMISSION = "com.example.usbprobe.USB_PERMISSION";
     private static final int ETH_HLEN = 14;
-    private static final int RX_URB_SIZE = 16384;
-    private static final int USBNET_DEFAULT_RX_QLEN = 4;
+    private static final int RX_TRANSFER_BUFFER_SIZE = 16384;
     private static final int RX_QUEUE_DEPTH = 4;
     private static final int TX_QUEUE_DEPTH = 16;
 
@@ -340,19 +339,20 @@ public final class MainActivity extends Activity {
         if (rxQueue.isEmpty()) log("RX software delivery queue empty; starting receive refill.");
         rxSubmitted = rxCompleted = rxErrors = 0;
         rxExecutor.execute(() -> {
-            log("RX queue started: Android synchronous emulation target-depth=" + USBNET_DEFAULT_RX_QLEN +
-                    " buffer=" + RX_URB_SIZE + " bytes (USB bulk IN endpoint 0x" + hex(bulkIn.getAddress()) + ")");
+            log("RX worker started: synchronous bulk IN transferBuffer=" + RX_TRANSFER_BUFFER_SIZE +
+                    " bytes softwareQueueDepth=" + RX_QUEUE_DEPTH +
+                    " endpoint=0x" + hex(bulkIn.getAddress()));
             while (rxRunning.get()) {
                 UsbDeviceConnection c = connection;
                 UsbEndpoint endpoint = bulkIn;
                 if (!configured || c == null || endpoint == null) break;
-                byte[] transfer = new byte[RX_URB_SIZE];
+                byte[] transfer = new byte[RX_TRANSFER_BUFFER_SIZE];
                 int result;
                 try {
-                    // Android exposes synchronous bulkTransfer, so a dedicated worker
-                    // maintains a bounded set of posted receive buffers by pipelining
-                    // at the application layer; true concurrent URBs are not exposed.
-                    int requestLength = RX_URB_SIZE - (RX_URB_SIZE % Math.max(1, maxPacketIn));
+                    // One blocking read is in flight at a time. rxQueue is a bounded
+                    // software delivery queue, not a pool of posted USB requests.
+                    int requestLength = RX_TRANSFER_BUFFER_SIZE -
+                            (RX_TRANSFER_BUFFER_SIZE % Math.max(1, maxPacketIn));
                     result = c.bulkTransfer(endpoint, transfer, requestLength, 5000);
                     rxSubmitted++;
                     if (result > 0) {
