@@ -428,8 +428,6 @@ public final class MainActivity extends Activity {
                     result.ethernet = true;
                     result.ethernetControlInterface = currentInterface;
                     result.macStringIndex = raw[off + 3] & 0xff;
-                    result.macStringIndex = result.macStringIndex == 0 ? -1 : result.macStringIndex;
-                    result.macStringIndex = result.macStringIndex < 0 ? 0 : result.macStringIndex;
                     result.maxSegmentSize = u16(raw, off + 8);
                     result.multicastFilterCount = u16(raw, off + 10);
                     result.capabilities = raw[off + 12] & 0xff;
