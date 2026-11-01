@@ -77,3 +77,25 @@ Zapisuj dokładny model adaptera, Android build, godzinę zdarzenia oraz logi ap
 - To potwierdza tylko powodzenie claim. Nie mamy jeszcze porównywalnego testu transferu ani pełnego pomiaru stabilności sterownika dla obu adapterów.
 
 **Nie wybieramy zwycięzcy na podstawie samego claim.** Następny pomiar to porównywalne wyniki bulk IN/OUT na konkretnych deskryptorach. Obsługa wielu modeli i ewentualne handshake powinny później powstać jako jawne profile protokołu, oparte na deskryptorach, dokumentacji i pomiarach, a nie na samym VID:PID.
+
+
+## Etap CDC host (2026-11-01)
+
+Wersja testowa dodaje jawny przycisk **CDC: SET_ETHERNET_PACKET_FILTER**. Kolejność jest celowo ręczna:
+
+1. Otwórz adapter.
+2. Wybierz deskryptor interfejsu i naciśnij **CLAIM**.
+3. Opcjonalnie naciśnij osobno **SET_INTERFACE**. Nie jest wywoływane automatycznie.
+4. Naciśnij **CDC: SET_ETHERNET_PACKET_FILTER**. Aplikacja odczytuje standardowy deskryptor konfiguracji USB (GET_DESCRIPTOR), parsuje CDC Header, Union oraz Ethernet Functional Descriptor, a następnie wysyła:
+   - bmRequestType = 0x21 (Class | Interface | Host-to-device)
+   - bRequest = 0x43 (SET_ETHERNET_PACKET_FILTER)
+   - wValue = 0x000C (DIRECTED | BROADCAST)
+   - wIndex = numer interfejsu kontrolnego z Ethernet Functional Descriptor (fallback: master z Union)
+   - wLength = 0
+5. Dopiero potem wykonuj osobne pomiary Bulk IN/OUT.
+
+Żądanie CDC jest kierowane do interfejsu kontrolnego, nie do interfejsu danych. Sukces controlTransfer oznacza przyjęcie żądania na poziomie USB, nie dowodzi poprawnego toru ECM Bulk ani obsługi PHY. Przycisk nie ustawia konfiguracji USB, nie przełącza alternate setting, nie wykonuje DHCP/ARP/IP i nie zmienia routingu.
+
+**CLAIM / sterownik jądra:** `claimInterface(..., true)` pozostaje ręcznym krokiem. Flaga force prosi Androidowy host stack o odłączenie sterownika jądra, jeśli platforma na to pozwala. Wynik `true` nie jest dowodem, że sterownik `cdc_ether` odpiął się skutecznie lub że interfejs `eth0` zniknął. Te zdarzenia należy weryfikować niezależnie przez dmesg/logcat i obserwację systemu. Bez roota aplikacja nie wykonuje bezpośredniego „kill eth0”.
+
+Probe nie enumeruje już `java.net.NetworkInterface`: log pozostaje czysto USB/CDC, aby nie mieszać pomiaru z reakcjami Androidowego frameworka sieciowego.
