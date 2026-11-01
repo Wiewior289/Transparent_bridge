@@ -36,6 +36,7 @@ public final class MainActivity extends Activity {
     private static final int CDC_PACKET_TYPE_PROMISCUOUS = 0x0008;
     private static final int ETH_HLEN = 14;
     private static final int RX_URB_SIZE = 16384;
+    private static final int USBNET_DEFAULT_RX_QLEN = 4;
     private static final int RX_QUEUE_DEPTH = 4;
     private static final int TX_QUEUE_DEPTH = 16;
     private static final int USB_CTRL_SET_TIMEOUT = 5000;
@@ -44,6 +45,7 @@ public final class MainActivity extends Activity {
     private final ExecutorService txExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService rxExecutor = Executors.newSingleThreadExecutor();
     private final AtomicBoolean rxRunning = new AtomicBoolean(false);
+    private final AtomicBoolean txWorkerStarted = new AtomicBoolean(false);
     private final ArrayBlockingQueue<byte[]> txQueue = new ArrayBlockingQueue<>(TX_QUEUE_DEPTH);
     private final ArrayBlockingQueue<byte[]> rxQueue = new ArrayBlockingQueue<>(RX_QUEUE_DEPTH);
     private final Object connectionLock = new Object();
@@ -343,6 +345,7 @@ public final class MainActivity extends Activity {
     }
 
     private void startTxWorker() {
+        if (!txWorkerStarted.compareAndSet(false, true)) return;
         txRunning = true;
         txExecutor.execute(() -> {
             while (txRunning && !Thread.currentThread().isInterrupted()) {
@@ -384,7 +387,8 @@ public final class MainActivity extends Activity {
      */
     private byte[] applyUsbnetTxLengthPolicy(byte[] frame) {
         if (maxPacket <= 0 || frame.length % maxPacket != 0) return frame;
-        // Linux usbnet core adds one byte unless FLAG_SEND_ZLP is set.
+        // The generic CDC binding shown in cdc_ether.c does not set a per-device
+        // FLAG_SEND_ZLP here. usbnet core therefore adds one byte on this path.
         return Arrays.copyOf(frame, frame.length + 1);
     }
 
@@ -393,7 +397,7 @@ public final class MainActivity extends Activity {
         byte[] frame = createArpWhoHasFrame();
         if (!txQueue.offer(frame)) { log("TX queue full; frame not submitted."); return; }
         log("TX queued kernel-style Ethernet ARP who-has frame len=" + frame.length +
-                " sourceMAC=" + (macAddress == null ? "unknown" : macAddress));
+                " sourceMAC=" + macAddress);
     }
 
     /**
@@ -403,7 +407,10 @@ public final class MainActivity extends Activity {
      */
     private byte[] createArpWhoHasFrame() {
         byte[] source = parseMac(macAddress);
-        if (source == null) source = new byte[]{0x02, 0x43, 0x44, 0x43, 0x45, 0x43};
+        if (source == null) {
+            log("TX blocked: CDC iMACAddress string unavailable/invalid; kernel usbnet_cdc_bind() would fail MAC acquisition.");
+            return;
+        }
         byte[] f = new byte[60];
         Arrays.fill(f, 0, 6, (byte)0xFF);
         System.arraycopy(source, 0, f, 6, 6);
@@ -429,9 +436,10 @@ public final class MainActivity extends Activity {
     private void startRx() {
         if (!configured) { log("RX blocked: CDC bind not complete."); return; }
         if (!rxRunning.compareAndSet(false, true)) { log("RX queue already running."); return; }
+        if (rxQueue.isEmpty()) log("RX software delivery queue empty; starting receive refill.");
         rxSubmitted = rxCompleted = rxErrors = 0;
         rxExecutor.execute(() -> {
-            log("RX queue started: usbnet-style depth=" + RX_QUEUE_DEPTH +
+            log("RX queue started: Android synchronous emulation depth=" + USBNET_DEFAULT_RX_QLEN +
                     " buffer=" + RX_URB_SIZE + " bytes (USB bulk IN endpoint 0x" + hex(bulkIn.getAddress()) + ")");
             while (rxRunning.get()) {
                 UsbDeviceConnection c = connection;
@@ -503,7 +511,7 @@ public final class MainActivity extends Activity {
         rxRunning.set(false);
         txRunning = false;
         txQueue.clear();
-        log("Queue stop requested.");
+        log("Queue stop requested. Restarting TX worker requires reconnect/reconfigure.");
     }
 
     private void closeDevice() {
@@ -511,6 +519,7 @@ public final class MainActivity extends Activity {
         rxRunning.set(false);
         txRunning = false;
         txQueue.clear();
+        txWorkerStarted.set(false);
         UsbDeviceConnection c;
         synchronized (connectionLock) { c = connection; connection = null; }
         if (c != null) {
