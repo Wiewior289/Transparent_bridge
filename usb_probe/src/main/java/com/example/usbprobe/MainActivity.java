@@ -20,8 +20,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * - claim the CDC control + CDC data interfaces with force=true (detach cdc_ether)
  * - select the CDC data alternate setting and bulk endpoints
  * - CDC SET_ETHERNET_PACKET_FILTER
- * - persistent bounded RX queue (usbnet rxq analogue), callback-driven resubmission
- * - TX frame queue, exact Ethernet frame bytes and usbnet maxpacket/ZLP policy
+ * - bounded software RX delivery queue fed by a synchronous bulk-IN worker
+ * - bounded TX frame queue and usbnet-inspired maxpacket length policy
  *
  * This is deliberately not a complete Linux usbnet implementation: public Android
  * USB Host does not expose URBs, anchors, tasklets, netdev, or kernel PM primitives.
@@ -74,7 +74,7 @@ public final class MainActivity extends Activity {
             boolean granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
             log("USB_PERMISSION granted=" + granted);
             if (granted && selected != null) controlExecutor.execute(() -> openAndConfigure(selected));
-            else controlExecutor.execute(this::tryNextCandidate);
+            else controlExecutor.execute(MainActivity.this::tryNextCandidate);
         }
     };
 
@@ -236,8 +236,9 @@ public final class MainActivity extends Activity {
     }
 
     private void startTxWorker() {
-        if (!configured || !txWorkerStarted.compareAndSet(false, true)) return;
+        if (!configured) return;
         txRunning = true;
+        if (!txWorkerStarted.compareAndSet(false, true)) return;
         txExecutor.execute(() -> {
             try {
                 while (txRunning && !Thread.currentThread().isInterrupted()) {
@@ -268,6 +269,9 @@ public final class MainActivity extends Activity {
                 }
             } finally {
                 txWorkerStarted.set(false);
+                // A reconnect can race the old worker's final transfer. If the link
+                // is ready again, make sure a worker exists for the new session.
+                if (configured && txRunning) startTxWorker();
             }
         });
     }
