@@ -160,16 +160,33 @@ public final class MainActivity extends Activity {
             return;
         }
 
-        UsbInterface comm = findInterface(device, function.controlInterface, 0);
-        UsbInterface dataAlt = chooseDataAlternate(device, function.dataInterface);
+        // IMPORTANT: interface IDs repeat across USB configurations. Resolve the
+        // CDC interfaces inside the configuration that supplied the CDC descriptors,
+        // not by scanning UsbDevice's flattened interface list.
+        UsbConfiguration cdcConfig = findConfiguration(device, function.configurationValue);
+        if (cdcConfig == null) {
+            log("CDC configuration value=" + function.configurationValue +
+                    " is absent from Android UsbDevice configurations. STOP.");
+            closeDevice();
+            return;
+        }
+        log("SELECT CONFIG id=" + cdcConfig.getId() + " interfaces=" +
+                cdcConfig.getInterfaceCount() + " (CDC descriptor configValue=" +
+                function.configurationValue + ")");
+
+        UsbInterface comm = findInterface(cdcConfig, function.controlInterface, 0);
+        UsbInterface dataAlt = chooseDataAlternate(cdcConfig, function.dataInterface);
+        log("RESOLVED control=" + describeInterface(comm) +
+                " data=" + describeInterface(dataAlt));
         if (comm == null || dataAlt == null) {
-            log("CDC Union references missing control/data alternate setting. STOP.");
+            log("CDC Union references missing control/data alternate setting in selected configuration. STOP.");
             closeDevice();
             return;
         }
         if (comm.getInterfaceClass() != 2 || comm.getInterfaceSubclass() != 6 ||
                 dataAlt.getInterfaceClass() != 10 || !hasBulkPair(dataAlt)) {
-            log("CDC role validation failed against class descriptors. STOP.");
+            log("CDC role validation failed: control=" + describeInterface(comm) +
+                    " data=" + describeInterface(dataAlt) + ". STOP.");
             closeDevice();
             return;
         }
@@ -300,23 +317,43 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private UsbInterface findInterface(UsbDevice d, int id, int alt) {
-        for (int i = 0; i < d.getInterfaceCount(); i++) {
-            UsbInterface in = d.getInterface(i);
+    private UsbConfiguration findConfiguration(UsbDevice device, int configurationValue) {
+        for (int i = 0; i < device.getConfigurationCount(); i++) {
+            UsbConfiguration config = device.getConfiguration(i);
+            log("CONFIG API index=" + i + " id=" + config.getId() +
+                    " interfaces=" + config.getInterfaceCount());
+            if (config.getId() == configurationValue) return config;
+        }
+        return null;
+    }
+
+    private UsbInterface findInterface(UsbConfiguration config, int id, int alt) {
+        for (int i = 0; i < config.getInterfaceCount(); i++) {
+            UsbInterface in = config.getInterface(i);
             if (in.getId() == id && in.getAlternateSetting() == alt) return in;
         }
         return null;
     }
 
-    private UsbInterface chooseDataAlternate(UsbDevice d, int id) {
+    private UsbInterface chooseDataAlternate(UsbConfiguration config, int id) {
         UsbInterface fallbackZero = null;
-        for (int i = 0; i < d.getInterfaceCount(); i++) {
-            UsbInterface in = d.getInterface(i);
+        for (int i = 0; i < config.getInterfaceCount(); i++) {
+            UsbInterface in = config.getInterface(i);
             if (in.getId() != id || in.getInterfaceClass() != 10) continue;
             if (in.getAlternateSetting() == 0) fallbackZero = in;
             if (hasBulkPair(in)) return in;
         }
         return fallbackZero != null && hasBulkPair(fallbackZero) ? fallbackZero : null;
+    }
+
+    private String describeInterface(UsbInterface in) {
+        if (in == null) return "(null)";
+        return "id=" + in.getId() + "/alt=" + in.getAlternateSetting() +
+                "/class=0x" + hex(in.getInterfaceClass()) +
+                "/sub=0x" + hex(in.getInterfaceSubclass()) +
+                "/proto=0x" + hex(in.getInterfaceProtocol()) +
+                "/eps=" + in.getEndpointCount() +
+                "/bulkPair=" + hasBulkPair(in);
     }
 
     private boolean hasBulkPair(UsbInterface in) {
