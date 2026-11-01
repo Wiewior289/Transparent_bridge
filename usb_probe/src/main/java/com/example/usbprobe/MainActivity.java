@@ -97,7 +97,7 @@ public final class MainActivity extends Activity {
         if(c==null){log("OPEN FAILED");return;}
         connection=c; log("OPEN OK fd="+c.getFileDescriptor());
         int master=-1,slave=-1;
-        boolean rawDescriptors=false;
+        boolean rawDescriptors=false, cdcHeader=false, cdcEthernet=false, cdcUnion=false;
         // wValue low byte is the configuration descriptor index, not bConfigurationValue.
         // Probe every configuration because this adapter exposes a vendor-specific config
         // and a separate CDC Ethernet config.
@@ -108,7 +108,7 @@ public final class MainActivity extends Activity {
             if(n<=0) continue;
             rawDescriptors=true;
             int candidateMaster=-1,candidateSlave=-1;
-            boolean hasCdcEtherControl=false;
+            boolean hasCdcEtherControl=false, hasHeader=false, hasEthernet=false;
             for(int p=0;p+2<=n;) {
                 int len=raw[p]&255,type=raw[p+1]&255;
                 if(len<2||p+len>n){log("Malformed descriptor offset="+p);break;}
@@ -120,15 +120,24 @@ public final class MainActivity extends Activity {
                 if(type==0x24&&len>=3) {
                     int sub=raw[p+2]&255;
                     if(sub==6&&len>=5){candidateMaster=raw[p+3]&255;candidateSlave=raw[p+4]&255;log("CDC UNION master="+candidateMaster+" slave="+candidateSlave);}
-                    else if(sub==0)log("CDC HEADER descriptor");
-                    else if(sub==0x0F)log("CDC ETHERNET descriptor len="+len);
+                    else if(sub==0){hasHeader=true;log("CDC HEADER descriptor");}
+                    else if(sub==0x0F){hasEthernet=true;log("CDC ETHERNET descriptor len="+len);}
                     else log(String.format(Locale.US,"CDC functional subtype=%02X len=%d",sub,len));
                 }
                 p+=len;
             }
-            if(hasCdcEtherControl && candidateMaster>=0) {master=candidateMaster;slave=candidateSlave;}
+            if(hasCdcEtherControl && candidateMaster>=0) {
+                master=candidateMaster;slave=candidateSlave;
+                cdcHeader=hasHeader;cdcEthernet=hasEthernet;cdcUnion=true;
+            }
         }
         if(!rawDescriptors)log("Raw configuration descriptor unavailable; using exposed interface descriptors only.");
+        if(rawDescriptors && !(cdcHeader && cdcEthernet && cdcUnion)) {
+            log("KERNEL-EQUIVALENT CDC VALIDATION FAILED: required HEADER + UNION + ETHERNET descriptors not all present.");
+            log("Stop before claiming interfaces; do not substitute a vendor protocol without evidence.");
+            return;
+        }
+        if(rawDescriptors)log("KERNEL-EQUIVALENT CDC validation passed: HEADER + UNION + ETHERNET.");
 
         for(int i=0;i<d.getInterfaceCount();i++) {
             UsbInterface in=d.getInterface(i);
