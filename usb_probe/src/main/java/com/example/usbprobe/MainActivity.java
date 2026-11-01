@@ -38,6 +38,7 @@ public final class MainActivity extends Activity {
     private static final int RX_URB_SIZE = 16384;
     private static final int USBNET_DEFAULT_RX_QLEN = 4;
     private static final int RX_QUEUE_DEPTH = 4;
+    private static final int USBNET_DEFAULT_RX_QLEN = 4;
     private static final int TX_QUEUE_DEPTH = 16;
     private static final int USB_CTRL_SET_TIMEOUT = 5000;
 
@@ -63,6 +64,7 @@ public final class MainActivity extends Activity {
     private String macAddress;
     private volatile boolean configured;
     private volatile boolean txRunning;
+    private volatile boolean txWorkerStarted;
     private volatile int rxSubmitted;
     private volatile int rxCompleted;
     private volatile int rxErrors;
@@ -346,6 +348,8 @@ public final class MainActivity extends Activity {
 
     private void startTxWorker() {
         if (!txWorkerStarted.compareAndSet(false, true)) return;
+        if (txWorkerStarted) return;
+        txWorkerStarted = true;
         txRunning = true;
         txExecutor.execute(() -> {
             while (txRunning && !Thread.currentThread().isInterrupted()) {
@@ -439,7 +443,7 @@ public final class MainActivity extends Activity {
         if (rxQueue.isEmpty()) log("RX software delivery queue empty; starting receive refill.");
         rxSubmitted = rxCompleted = rxErrors = 0;
         rxExecutor.execute(() -> {
-            log("RX queue started: Android synchronous emulation depth=" + USBNET_DEFAULT_RX_QLEN +
+            log("RX queue started: Android synchronous emulation target-depth=" + USBNET_DEFAULT_RX_QLEN +
                     " buffer=" + RX_URB_SIZE + " bytes (USB bulk IN endpoint 0x" + hex(bulkIn.getAddress()) + ")");
             while (rxRunning.get()) {
                 UsbDeviceConnection c = connection;
@@ -511,7 +515,8 @@ public final class MainActivity extends Activity {
         rxRunning.set(false);
         txRunning = false;
         txQueue.clear();
-        log("Queue stop requested. Restarting TX worker requires reconnect/reconfigure.");
+        txWorkerStarted = false;
+        log("Queue stop requested. TX worker stopped; reconfigure USB to restart worker.");
     }
 
     private void closeDevice() {
