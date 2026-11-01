@@ -28,18 +28,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class MainActivity extends Activity {
     private static final String ACTION_PERMISSION = "com.example.usbprobe.USB_PERMISSION";
-    private static final int VID = 0x1A86, PID = 0x5394;
-    private static final int CDC_SET_ETHERNET_PACKET_FILTER = 0x43;
-    private static final int CDC_PACKET_TYPE_DIRECTED = 0x0001;
-    private static final int CDC_PACKET_TYPE_BROADCAST = 0x0002;
-    private static final int CDC_PACKET_TYPE_ALL_MULTICAST = 0x0004;
-    private static final int CDC_PACKET_TYPE_PROMISCUOUS = 0x0008;
     private static final int ETH_HLEN = 14;
     private static final int RX_URB_SIZE = 16384;
     private static final int USBNET_DEFAULT_RX_QLEN = 4;
     private static final int RX_QUEUE_DEPTH = 4;
     private static final int TX_QUEUE_DEPTH = 16;
-    private static final int USB_CTRL_SET_TIMEOUT = 5000;
 
     private final ExecutorService controlExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService txExecutor = Executors.newSingleThreadExecutor();
@@ -58,6 +51,9 @@ public final class MainActivity extends Activity {
     private UsbInterface dataInterface;
     private UsbEndpoint bulkIn;
     private UsbEndpoint bulkOut;
+    private CdcEcmBinder binder;
+    private final List<UsbDevice> scanCandidates = new ArrayList<>();
+    private int nextCandidateIndex;
     private int maxPacket;
     private int maxPacketIn;
     private int maxSegmentSize = 1514;
@@ -78,6 +74,7 @@ public final class MainActivity extends Activity {
             boolean granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false);
             log("USB_PERMISSION granted=" + granted);
             if (granted && selected != null) controlExecutor.execute(() -> openAndConfigure(selected));
+            else controlExecutor.execute(this::tryNextCandidate);
         }
     };
 
@@ -106,7 +103,7 @@ public final class MainActivity extends Activity {
             registerReceiver(permissionReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
         else registerReceiver(permissionReceiver, filter);
         receiverRegistered = true;
-        log("CDC-ECM USERLAND REPLAY ready for USB " + String.format(Locale.US, "%04X:%04X", VID, PID));
+        log("CDC-ECM userland replay ready; discovery uses CDC descriptors, not a VID/PID allowlist.");
         log("This application detaches cdc_ether via claimInterface(force=true); eth0 disappearance is expected.");
         log("No CH9200 vendor commands are sent. Driver match is generic CDC class/subclass/protocol.");
     }
@@ -119,252 +116,106 @@ public final class MainActivity extends Activity {
     }
 
     private void scan() {
-        for (UsbDevice device : manager.getDeviceList().values()) {
-            log(String.format(Locale.US, "DEVICE %04X:%04X %s configs=%d apiInterfaces=%d",
-                    device.getVendorId(), device.getProductId(), device.getDeviceName(),
-                    device.getConfigurationCount(), device.getInterfaceCount()));
-            if (device.getVendorId() == VID && device.getProductId() == PID) {
-                selected = device;
-                if (manager.hasPermission(device)) controlExecutor.execute(() -> openAndConfigure(device));
-                else {
-                    int flags = PendingIntent.FLAG_UPDATE_CURRENT;
-                    if (Build.VERSION.SDK_INT >= 31) flags |= PendingIntent.FLAG_MUTABLE;
-                    manager.requestPermission(device,
-                            PendingIntent.getBroadcast(this, 0, new Intent(ACTION_PERMISSION), flags));
-                    log("USB host permission requested.");
-                }
-                return;
-            }
+        scanCandidates.clear();
+        scanCandidates.addAll(manager.getDeviceList().values());
+        nextCandidateIndex = 0;
+        log("USB scan candidates=" + scanCandidates.size());
+        if (scanCandidates.isEmpty()) {
+            log("No USB devices attached.");
+            return;
         }
-        log("Target USB adapter not present.");
+        tryNextCandidate();
+    }
+
+    private void tryNextCandidate() {
+        while (nextCandidateIndex < scanCandidates.size()) {
+            UsbDevice device = scanCandidates.get(nextCandidateIndex++);
+            selected = device;
+            log(String.format(Locale.US, "CDC candidate %04X:%04X %s configs=%d",
+                    device.getVendorId(), device.getProductId(), device.getDeviceName(),
+                    device.getConfigurationCount()));
+            if (manager.hasPermission(device)) {
+                controlExecutor.execute(() -> openAndConfigure(device));
+            } else {
+                int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+                if (Build.VERSION.SDK_INT >= 31) flags |= PendingIntent.FLAG_MUTABLE;
+                manager.requestPermission(device,
+                        PendingIntent.getBroadcast(this, 0, new Intent(ACTION_PERMISSION), flags));
+                log("USB host permission requested for candidate.");
+            }
+            return;
+        }
+        selected = null;
+        log("No attached device exposed a complete, unambiguous CDC-ECM function.");
     }
 
     private void openAndConfigure(UsbDevice device) {
         closeDevice();
         UsbDeviceConnection c = manager.openDevice(device);
-        if (c == null) { log("OPEN FAILED"); return; }
+        if (c == null) {
+            log("OPEN FAILED; trying next USB candidate.");
+            tryNextCandidate();
+            return;
+        }
         synchronized (connectionLock) { connection = c; }
         log("OPEN OK fd=" + c.getFileDescriptor());
 
-        CdcFunction function;
+        CdcEcmProfile profile;
         try {
-            function = parseCdcFunction(c, device);
+            profile = new CdcDescriptorScanner(this::log).scan(c, device);
         } catch (Exception e) {
-            log("CDC descriptor parse failed: " + e);
+            log("CDC descriptor scan failed: " + e);
             closeDevice();
+            tryNextCandidate();
             return;
         }
-        if (function == null) {
-            log("No complete CDC Ethernet function: HEADER + UNION + ETHERNET required. STOP.");
+        if (profile == null) {
+            log("No complete, unambiguous CDC-ECM function on this device. STOP.");
             closeDevice();
-            return;
-        }
-
-        // IMPORTANT: interface IDs repeat across USB configurations. Resolve the
-        // CDC interfaces inside the configuration that supplied the CDC descriptors,
-        // not by scanning UsbDevice's flattened interface list.
-        UsbConfiguration cdcConfig = findConfiguration(device, function.configurationValue);
-        if (cdcConfig == null) {
-            log("CDC configuration value=" + function.configurationValue +
-                    " is absent from Android UsbDevice configurations. STOP.");
-            closeDevice();
-            return;
-        }
-        log("SELECT CONFIG id=" + cdcConfig.getId() + " interfaces=" +
-                cdcConfig.getInterfaceCount() + " (CDC descriptor configValue=" +
-                function.configurationValue + ")");
-
-        UsbInterface comm = findInterface(cdcConfig, function.controlInterface, 0);
-        UsbInterface dataAlt = chooseDataAlternate(cdcConfig, function.dataInterface);
-        log("RESOLVED control=" + describeInterface(comm) +
-                " data=" + describeInterface(dataAlt));
-        if (comm == null || dataAlt == null) {
-            log("CDC Union references missing control/data alternate setting in selected configuration. STOP.");
-            closeDevice();
-            return;
-        }
-        if (comm.getInterfaceClass() != 2 || comm.getInterfaceSubclass() != 6 ||
-                dataAlt.getInterfaceClass() != 10 || !hasBulkPair(dataAlt)) {
-            log("CDC role validation failed: control=" + describeInterface(comm) +
-                    " data=" + describeInterface(dataAlt) + ". STOP.");
-            closeDevice();
+            tryNextCandidate();
             return;
         }
 
-        controlInterface = comm;
-        dataInterface = dataAlt;
-        for (int i = 0; i < dataAlt.getEndpointCount(); i++) {
-            UsbEndpoint endpoint = dataAlt.getEndpoint(i);
-            if (endpoint.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK) {
-                if (endpoint.getDirection() == UsbConstants.USB_DIR_IN) bulkIn = endpoint;
-                else if (endpoint.getDirection() == UsbConstants.USB_DIR_OUT) bulkOut = endpoint;
-            }
-        }
-        if (bulkIn == null || bulkOut == null) {
-            log("Bulk endpoint pair absent.");
-            closeDevice();
-            return;
-        }
+        controlInterface = profile.controlInterface;
+        dataInterface = profile.dataInterface;
+        bulkIn = profile.bulkIn;
+        bulkOut = profile.bulkOut;
         maxPacket = bulkOut.getMaxPacketSize();
         maxPacketIn = bulkIn.getMaxPacketSize();
-        maxSegmentSize = function.maxSegmentSize > ETH_HLEN ? function.maxSegmentSize : 1514;
-        macAddress = function.macStringIndex > 0 ? readUsbString(c, function.macStringIndex) : null;
+        maxSegmentSize = profile.maxSegmentSize > ETH_HLEN ? profile.maxSegmentSize : 1514;
+        macAddress = profile.macStringIndex > 0 ? readUsbString(c, profile.macStringIndex) : null;
 
-        log("CDC function: control=" + function.controlInterface + " data=" +
-                function.dataInterface + " MAC-index=" + function.macStringIndex +
-                " wMaxSegmentSize=" + function.maxSegmentSize);
-        log("CDC control IF id=" + comm.getId() + " alt=" + comm.getAlternateSetting() +
-                " interruptEPs=" + comm.getEndpointCount());
-        log("CDC data IF id=" + dataAlt.getId() + " alt=" + dataAlt.getAlternateSetting() +
-                " bulk IN=0x" + hex(bulkIn.getAddress()) + " OUT=0x" + hex(bulkOut.getAddress()) +
-                " wMaxPacketSize OUT=" + maxPacket + " IN=" + maxPacketIn + " maxSegment=" + maxSegmentSize);
+        log("CDC PROFILE configValue=" + profile.configurationValue +
+                " bcdCDC=" + String.format(Locale.US, "%04X", profile.bcdCdc) +
+                " control=" + profile.controlInterfaceNumber +
+                " data=" + profile.dataInterfaceNumber +
+                " iMAC=" + profile.macStringIndex +
+                " maxSegment=" + profile.maxSegmentSize);
+        log("CDC control IF id=" + controlInterface.getId() +
+                " alt=" + controlInterface.getAlternateSetting() +
+                " interruptEPs=" + controlInterface.getEndpointCount());
+        log("CDC data IF id=" + dataInterface.getId() +
+                " alt=" + dataInterface.getAlternateSetting() +
+                " bulk IN=0x" + hex(bulkIn.getAddress()) +
+                " OUT=0x" + hex(bulkOut.getAddress()) +
+                " wMaxPacketSize OUT=" + maxPacket + " IN=" + maxPacketIn +
+                " maxSegment=" + maxSegmentSize);
         log("CDC iMACAddress string=" + (macAddress == null ? "(unavailable)" : macAddress));
+        log("CONFIG NOTE: Android public USB Host APIs do not expose a reliable active-configuration query here; " +
+                "scanner resolved descriptor configurationValue=" + profile.configurationValue +
+                ". Claim/setInterface results remain the runtime test.");
 
-        // usbnet_generic_cdc_bind(): claim the data interface with the same driver binding logic.
-        boolean controlClaimed = c.claimInterface(comm, true);
-        log("CLAIM control force=true -> " + controlClaimed);
-        if (!controlClaimed) { closeDevice(); return; }
-        boolean dataClaimed = c.claimInterface(dataAlt, true);
-        log("CLAIM data force=true -> " + dataClaimed);
-        if (!dataClaimed) { c.releaseInterface(comm); closeDevice(); return; }
-
-        boolean altSet = c.setInterface(dataAlt);
-        log("usbnet_get_endpoints equivalent SET_INTERFACE alt=" +
-                dataAlt.getAlternateSetting() + " -> " + altSet);
-        if (!altSet) { closeDevice(); return; }
-
-        // usbnet_cdc_update_filter(): initial directed+broadcast reception.
-        int filter = CDC_PACKET_TYPE_DIRECTED | CDC_PACKET_TYPE_BROADCAST;
-        int filterResult = c.controlTransfer(0x21, CDC_SET_ETHERNET_PACKET_FILTER,
-                filter, comm.getId(), null, 0, USB_CTRL_SET_TIMEOUT);
-        log("CDC SET_ETHERNET_PACKET_FILTER value=0x" + hex(filter) +
-                " wIndex=" + comm.getId() + " result=" + filterResult);
-        if (filterResult < 0) {
-            log("CDC filter init failed; userland bind is not ready.");
+        binder = new CdcEcmBinder(c, profile, this::log);
+        if (!binder.bind()) {
             closeDevice();
+            tryNextCandidate();
             return;
         }
+
         configured = true;
-        log("CDC BIND READY. Device ownership should now resolve to usbfs, not cdc_ether.");
-        log("Note: API-level claim result is not an independent sysfs usbfs verification.");
+        log("CDC BIND READY. This confirms descriptor validation and control setup, not successful Ethernet RX/TX.");
+        log("API-level claim success is not independent sysfs proof of usbfs ownership.");
         startTxWorker();
-    }
-
-    private CdcFunction parseCdcFunction(UsbDeviceConnection c, UsbDevice device) {
-        CdcFunction found = null;
-        for (int configIndex = 0; configIndex < device.getConfigurationCount(); configIndex++) {
-            byte[] bytes = new byte[4096];
-            int count = c.controlTransfer(0x80, 0x06, 0x0200 | configIndex,
-                    0, bytes, bytes.length, 2000);
-            log("GET_DESCRIPTOR CONFIG index=" + configIndex + " result=" + count);
-            if (count < 9) continue;
-            int configValue = u8(bytes, 5);
-            log("CONFIG descriptor index=" + configIndex + " bConfigurationValue=" +
-                    configValue + " bNumInterfaces=" + u8(bytes, 4));
-
-            int activeInterface = -1;
-            int activeAlternate = -1;
-            boolean header = false;
-            boolean ethernet = false;
-            int unionMaster = -1, unionSlave = -1;
-            int macIndex = 0, maxSegment = 0;
-            for (int p = 0; p + 2 <= count;) {
-                int length = u8(bytes, p), type = u8(bytes, p + 1);
-                if (length < 2 || p + length > count) {
-                    log("Malformed descriptor at offset=" + p + " len=" + length);
-                    break;
-                }
-                if (type == 4 && length >= 9) {
-                    activeInterface = u8(bytes, p + 2);
-                    activeAlternate = u8(bytes, p + 3);
-                    int cls = u8(bytes, p + 5), sub = u8(bytes, p + 6), proto = u8(bytes, p + 7);
-                    log(String.format(Locale.US, "  IF num=%d alt=%d class=%02X sub=%02X proto=%02X ep=%d",
-                            activeInterface, activeAlternate, cls, sub, proto, u8(bytes, p + 4)));
-                } else if (type == 0x24 && length >= 3) {
-                    int subtype = u8(bytes, p + 2);
-                    if (subtype == 0x00 && length >= 5) {
-                        header = true;
-                        log("  CDC HEADER bcdCDC=" + hex(u8(bytes, p + 4)) + hex(u8(bytes, p + 3)));
-                    } else if (subtype == 0x06 && length >= 5) {
-                        unionMaster = u8(bytes, p + 3);
-                        unionSlave = u8(bytes, p + 4);
-                        log("  CDC UNION master=" + unionMaster + " slave=" + unionSlave);
-                    } else if (subtype == 0x0F && length >= 13) {
-                        ethernet = true;
-                        macIndex = u8(bytes, p + 3);
-                        maxSegment = u8(bytes, p + 8) | (u8(bytes, p + 9) << 8);
-                        int multicastFilters = u8(bytes, p + 10) | (u8(bytes, p + 11) << 8);
-                        log("  CDC ETHERNET iMAC=" + macIndex + " maxSegment=" +
-                                maxSegment + " multicastFilters=" + multicastFilters +
-                                " powerFilters=" + u8(bytes, p + 12));
-                    }
-                }
-                p += length;
-            }
-            if (header && ethernet && unionMaster >= 0 && unionSlave >= 0) {
-                found = new CdcFunction(configValue, unionMaster, unionSlave, macIndex, maxSegment);
-                log("CDC descriptor set accepted (HEADER + UNION + ETHERNET).");
-            }
-        }
-        return found;
-    }
-
-    private static final class CdcFunction {
-        final int configurationValue, controlInterface, dataInterface, macStringIndex, maxSegmentSize;
-        CdcFunction(int config, int control, int data, int mac, int maxSegment) {
-            configurationValue = config; controlInterface = control; dataInterface = data;
-            macStringIndex = mac; maxSegmentSize = maxSegment;
-        }
-    }
-
-    private UsbConfiguration findConfiguration(UsbDevice device, int configurationValue) {
-        for (int i = 0; i < device.getConfigurationCount(); i++) {
-            UsbConfiguration config = device.getConfiguration(i);
-            log("CONFIG API index=" + i + " id=" + config.getId() +
-                    " interfaces=" + config.getInterfaceCount());
-            if (config.getId() == configurationValue) return config;
-        }
-        return null;
-    }
-
-    private UsbInterface findInterface(UsbConfiguration config, int id, int alt) {
-        for (int i = 0; i < config.getInterfaceCount(); i++) {
-            UsbInterface in = config.getInterface(i);
-            if (in.getId() == id && in.getAlternateSetting() == alt) return in;
-        }
-        return null;
-    }
-
-    private UsbInterface chooseDataAlternate(UsbConfiguration config, int id) {
-        UsbInterface fallbackZero = null;
-        for (int i = 0; i < config.getInterfaceCount(); i++) {
-            UsbInterface in = config.getInterface(i);
-            if (in.getId() != id || in.getInterfaceClass() != 10) continue;
-            if (in.getAlternateSetting() == 0) fallbackZero = in;
-            if (hasBulkPair(in)) return in;
-        }
-        return fallbackZero != null && hasBulkPair(fallbackZero) ? fallbackZero : null;
-    }
-
-    private String describeInterface(UsbInterface in) {
-        if (in == null) return "(null)";
-        return "id=" + in.getId() + "/alt=" + in.getAlternateSetting() +
-                "/class=0x" + hex(in.getInterfaceClass()) +
-                "/sub=0x" + hex(in.getInterfaceSubclass()) +
-                "/proto=0x" + hex(in.getInterfaceProtocol()) +
-                "/eps=" + in.getEndpointCount() +
-                "/bulkPair=" + hasBulkPair(in);
-    }
-
-    private boolean hasBulkPair(UsbInterface in) {
-        boolean input = false, output = false;
-        for (int i = 0; i < in.getEndpointCount(); i++) {
-            UsbEndpoint ep = in.getEndpoint(i);
-            if (ep.getType() != UsbConstants.USB_ENDPOINT_XFER_BULK || ep.getMaxPacketSize() <= 0) continue;
-            if (ep.getDirection() == UsbConstants.USB_DIR_IN) input = true;
-            else if (ep.getDirection() == UsbConstants.USB_DIR_OUT) output = true;
-        }
-        return input && output;
     }
 
     private String readUsbString(UsbDeviceConnection c, int index) {
@@ -377,7 +228,8 @@ public final class MainActivity extends Activity {
         }
         int length = Math.min(u8(buffer, 0), result);
         StringBuilder out = new StringBuilder();
-        for (int p = 2; p + 1 < length; p += 2) out.append((char)(u8(buffer, p) | (u8(buffer, p + 1) << 8)));
+        for (int p = 2; p + 1 < length; p += 2)
+            out.append((char)(u8(buffer, p) | (u8(buffer, p + 1) << 8)));
         String value = out.toString();
         log("USB string index=" + index + " -> " + value);
         return value;
@@ -567,15 +419,12 @@ public final class MainActivity extends Activity {
         txQueue.clear();
         UsbDeviceConnection c;
         synchronized (connectionLock) { c = connection; connection = null; }
+        if (binder != null) {
+            try { binder.close(); } catch (Exception e) { log("CDC binder close exception=" + e); }
+            binder = null;
+        }
         if (c != null) {
-            try {
-                if (dataInterface != null) log("RELEASE data=" + c.releaseInterface(dataInterface));
-            } catch (Exception e) { log("RELEASE data exception=" + e); }
-            try {
-                if (controlInterface != null && controlInterface != dataInterface)
-                    log("RELEASE control=" + c.releaseInterface(controlInterface));
-            } catch (Exception e) { log("RELEASE control exception=" + e); }
-            c.close();
+            try { c.close(); } catch (Exception e) { log("USB close exception=" + e); }
         }
         controlInterface = null; dataInterface = null; bulkIn = null; bulkOut = null;
         maxPacket = 0; maxPacketIn = 0; macAddress = null;
