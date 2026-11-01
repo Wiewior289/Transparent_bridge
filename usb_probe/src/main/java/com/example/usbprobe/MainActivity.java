@@ -457,7 +457,8 @@ public final class MainActivity extends Activity {
                     // Android exposes synchronous bulkTransfer, so a dedicated worker
                     // maintains a bounded set of posted receive buffers by pipelining
                     // at the application layer; true concurrent URBs are not exposed.
-                    int requestLength = RX_URB_SIZE - (RX_URB_SIZE % Math.max(1, maxPacketIn));\n                result = c.bulkTransfer(endpoint, transfer, requestLength, 5000);
+                    int requestLength = RX_URB_SIZE - (RX_URB_SIZE % Math.max(1, maxPacketIn));
+                    result = c.bulkTransfer(endpoint, transfer, requestLength, 5000);
                     rxSubmitted++;
                     if (result > 0) {
                         rxCompleted++;
