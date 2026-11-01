@@ -60,6 +60,7 @@ public final class MainActivity extends Activity {
     private UsbEndpoint bulkIn;
     private UsbEndpoint bulkOut;
     private int maxPacket;
+    private int maxPacketIn;
     private int maxSegmentSize = 1514;
     private String macAddress;
     private volatile boolean configured;
@@ -190,6 +191,7 @@ public final class MainActivity extends Activity {
             return;
         }
         maxPacket = bulkOut.getMaxPacketSize();
+        maxPacketIn = bulkIn.getMaxPacketSize();
         maxSegmentSize = function.maxSegmentSize > ETH_HLEN ? function.maxSegmentSize : 1514;
         macAddress = function.macStringIndex > 0 ? readUsbString(c, function.macStringIndex) : null;
 
@@ -200,7 +202,7 @@ public final class MainActivity extends Activity {
                 " interruptEPs=" + comm.getEndpointCount());
         log("CDC data IF id=" + dataAlt.getId() + " alt=" + dataAlt.getAlternateSetting() +
                 " bulk IN=0x" + hex(bulkIn.getAddress()) + " OUT=0x" + hex(bulkOut.getAddress()) +
-                " wMaxPacketSize=" + maxPacket + " maxSegment=" + maxSegmentSize);
+                " wMaxPacketSize OUT=" + maxPacket + " IN=" + maxPacketIn + " maxSegment=" + maxSegmentSize);
         log("CDC iMACAddress string=" + (macAddress == null ? "(unavailable)" : macAddress));
 
         // usbnet_generic_cdc_bind(): claim the data interface with the same driver binding logic.
@@ -455,7 +457,7 @@ public final class MainActivity extends Activity {
                     // Android exposes synchronous bulkTransfer, so a dedicated worker
                     // maintains a bounded set of posted receive buffers by pipelining
                     // at the application layer; true concurrent URBs are not exposed.
-                    result = c.bulkTransfer(endpoint, transfer, transfer.length, 5000);
+                    int requestLength = RX_URB_SIZE - (RX_URB_SIZE % Math.max(1, maxPacketIn));\n                result = c.bulkTransfer(endpoint, transfer, requestLength, 5000);
                     rxSubmitted++;
                     if (result > 0) {
                         rxCompleted++;
@@ -538,7 +540,7 @@ public final class MainActivity extends Activity {
             c.close();
         }
         controlInterface = null; dataInterface = null; bulkIn = null; bulkOut = null;
-        maxPacket = 0; macAddress = null;
+        maxPacket = 0; maxPacketIn = 0; macAddress = null;
         log("USB closed; kernel may rebind cdc_ether after usbfs releases the interface/device.");
     }
 
