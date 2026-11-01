@@ -18,7 +18,9 @@ No CH9200 vendor-register sequence, Realtek framing, routing, or NAT is included
 
 From repository root:
 
-    ./gradlew :usb_probe:assembleDebug --no-configuration-cache
+    gradle :usb_probe:assembleDebug --no-configuration-cache
+
+Use Gradle 9.3.1 and JDK 17. This repository branch currently does not track the `gradlew` launcher script; Android Studio can also import the root project and build the `usb_probe` module.
 
 APK:
 
