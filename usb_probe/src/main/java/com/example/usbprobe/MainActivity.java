@@ -96,26 +96,39 @@ public final class MainActivity extends Activity {
         UsbDeviceConnection c=manager.openDevice(d);
         if(c==null){log("OPEN FAILED");return;}
         connection=c; log("OPEN OK fd="+c.getFileDescriptor());
-        byte[] raw=new byte[4096];
-        int n=c.controlTransfer(0x80,0x06,0x0200,0,raw,raw.length,1500);
-        log("GET_DESCRIPTOR(CONFIG)="+n);
         int master=-1,slave=-1;
-        if(n>0) {
+        boolean rawDescriptors=false;
+        // wValue low byte is the configuration descriptor index, not bConfigurationValue.
+        // Probe every configuration because this adapter exposes a vendor-specific config
+        // and a separate CDC Ethernet config.
+        for(int cfgIndex=0;cfgIndex<d.getConfigurationCount();cfgIndex++) {
+            byte[] raw=new byte[4096];
+            int n=c.controlTransfer(0x80,0x06,0x0200|cfgIndex,0,raw,raw.length,1500);
+            log("GET_DESCRIPTOR(CONFIG index="+cfgIndex+")="+n);
+            if(n<=0) continue;
+            rawDescriptors=true;
+            int candidateMaster=-1,candidateSlave=-1;
+            boolean hasCdcEtherControl=false;
             for(int p=0;p+2<=n;) {
                 int len=raw[p]&255,type=raw[p+1]&255;
                 if(len<2||p+len>n){log("Malformed descriptor offset="+p);break;}
-                if(type==4&&len>=9) log(String.format(Locale.US,"RAW IF num=%d alt=%d class=%02X sub=%02X proto=%02X",
-                        raw[p+2]&255,raw[p+3]&255,raw[p+5]&255,raw[p+6]&255,raw[p+7]&255));
+                if(type==4&&len>=9) {
+                    int num=raw[p+2]&255,alt=raw[p+3]&255,cls=raw[p+5]&255,sub=raw[p+6]&255,proto=raw[p+7]&255;
+                    log(String.format(Locale.US,"CFG%d IF num=%d alt=%d class=%02X sub=%02X proto=%02X",cfgIndex,num,alt,cls,sub,proto));
+                    if(cls==2&&sub==6&&proto==0)hasCdcEtherControl=true;
+                }
                 if(type==0x24&&len>=3) {
                     int sub=raw[p+2]&255;
-                    if(sub==6&&len>=5){master=raw[p+3]&255;slave=raw[p+4]&255;log("CDC UNION master="+master+" slave="+slave);}
+                    if(sub==6&&len>=5){candidateMaster=raw[p+3]&255;candidateSlave=raw[p+4]&255;log("CDC UNION master="+candidateMaster+" slave="+candidateSlave);}
                     else if(sub==0)log("CDC HEADER descriptor");
                     else if(sub==0x0F)log("CDC ETHERNET descriptor len="+len);
                     else log(String.format(Locale.US,"CDC functional subtype=%02X len=%d",sub,len));
                 }
                 p+=len;
             }
-        } else log("Raw configuration descriptor unavailable; using exposed interface descriptors only.");
+            if(hasCdcEtherControl && candidateMaster>=0) {master=candidateMaster;slave=candidateSlave;}
+        }
+        if(!rawDescriptors)log("Raw configuration descriptor unavailable; using exposed interface descriptors only.");
 
         for(int i=0;i<d.getInterfaceCount();i++) {
             UsbInterface in=d.getInterface(i);
