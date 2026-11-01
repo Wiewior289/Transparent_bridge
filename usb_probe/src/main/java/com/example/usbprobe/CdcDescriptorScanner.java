@@ -165,7 +165,11 @@ final class CdcDescriptorScanner {
                 }
 
                 UsbInterface control = findInterface(config, union.master, 0);
+                int controlKey = interfaceKey(union.master, 0);
                 if (control == null ||
+                        !Integer.valueOf(USB_CLASS_COMM).equals(classByInterface.get(controlKey)) ||
+                        !Integer.valueOf(USB_SUBCLASS_ECM).equals(subclassByInterface.get(controlKey)) ||
+                        !Integer.valueOf(USB_PROTO_NONE).equals(protocolByInterface.get(controlKey)) ||
                         control.getInterfaceClass() != USB_CLASS_COMM ||
                         control.getInterfaceSubclass() != USB_SUBCLASS_ECM ||
                         control.getInterfaceProtocol() != USB_PROTO_NONE) {
@@ -179,8 +183,15 @@ final class CdcDescriptorScanner {
                 UsbEndpoint out = null;
                 for (int i = 0; i < config.getInterfaceCount(); i++) {
                     UsbInterface candidate = config.getInterface(i);
+                    int dataKey = interfaceKey(candidate.getId(), candidate.getAlternateSetting());
                     if (candidate.getId() != union.slave ||
-                            candidate.getInterfaceClass() != USB_CLASS_CDC_DATA) continue;
+                            candidate.getInterfaceClass() != USB_CLASS_CDC_DATA ||
+                            candidate.getInterfaceSubclass() != 0 ||
+                            candidate.getInterfaceProtocol() != 0 ||
+                            candidate.getEndpointCount() != 2 ||
+                            !Integer.valueOf(USB_CLASS_CDC_DATA).equals(classByInterface.get(dataKey)) ||
+                            !Integer.valueOf(0).equals(subclassByInterface.get(dataKey)) ||
+                            !Integer.valueOf(0).equals(protocolByInterface.get(dataKey))) continue;
                     UsbEndpoint candidateIn = null;
                     UsbEndpoint candidateOut = null;
                     boolean duplicateIn = false;
