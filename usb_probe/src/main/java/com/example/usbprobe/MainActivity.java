@@ -15,6 +15,9 @@ public final class MainActivity extends Activity {
     private static final String ACTION_PERMISSION = "com.example.usbprobe.USB_PERMISSION";
     private static final int VID = 0x1A86, PID = 0x5394;
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+    private final ExecutorService rxIo = Executors.newSingleThreadExecutor();
+    private final java.util.concurrent.atomic.AtomicBoolean rxRunning = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private volatile int rxQuickFailures = 0;
     private UsbManager manager;
     private TextView output;
     private UsbDevice selected;
@@ -39,7 +42,7 @@ public final class MainActivity extends Activity {
         root.setPadding(12,12,12,12); root.setOrientation(LinearLayout.VERTICAL);
         addButton(root, "1. Scan + parse CDC descriptors", v -> scan());
         addButton(root, "2. Send isolated test Ethernet frame", v -> io.execute(this::sendTest));
-        addButton(root, "3. Receive one bulk transfer (1500 ms)", v -> io.execute(this::receiveOne));
+        addButton(root, "3. Start / stop Halone-style RX loop", v -> toggleRx());
         addButton(root, "Release interfaces / close", v -> io.execute(this::closeDevice));
         output = new TextView(this); output.setTextSize(12); output.setTextIsSelectable(true);
         ScrollView scroll = new ScrollView(this); scroll.addView(output);
@@ -59,21 +62,27 @@ public final class MainActivity extends Activity {
     private void scan() {
         for (UsbDevice d : manager.getDeviceList().values()) {
             boolean match = d.getVendorId()==VID && d.getProductId()==PID;
-            log(String.format(Locale.US,"DEVICE %04X:%04X name=%s configurations=%d interfaces=%d",
+            log(String.format(Locale.US,"DEVICE %04X:%04X name=%s configurations=%d exposedInterfaces=%d",
                     d.getVendorId(),d.getProductId(),d.getDeviceName(),d.getConfigurationCount(),d.getInterfaceCount()));
-            for (int i=0;i<d.getInterfaceCount();i++) {
-                UsbInterface in=d.getInterface(i);
-                log(String.format(Locale.US," IF[%d] id=%d alt=%d class=%02X sub=%02X proto=%02X endpoints=%d",
-                        i,in.getId(),in.getAlternateSetting(),in.getInterfaceClass(),in.getInterfaceSubclass(),
-                        in.getInterfaceProtocol(),in.getEndpointCount()));
-                for(int e=0;e<in.getEndpointCount();e++) {
-                    UsbEndpoint ep=in.getEndpoint(e);
-                    log(String.format(Locale.US,"  EP %02X %s type=%d packet=%d",ep.getAddress(),
-                            ep.getDirection()==UsbConstants.USB_DIR_IN?"IN":"OUT",ep.getType(),ep.getMaxPacketSize()));
-                }
-                if(in.getInterfaceClass()==2 && in.getInterfaceSubclass()==6 && in.getInterfaceProtocol()==0) {
-                    log("GENERIC MATCH: class=COMM subclass=ETHERNET protocol=NONE");
-                    match=true;
+            // Enumerate every configuration. A descriptor in a non-active configuration is not usable yet.
+            for (int ci=0;ci<d.getConfigurationCount();ci++) {
+                UsbConfiguration cfg=d.getConfiguration(ci);
+                log(String.format(Locale.US," CONFIG index=%d value=%d name=%s interfaces=%d",
+                        ci,cfg.getId(),cfg.getName(),cfg.getInterfaceCount()));
+                for (int i=0;i<cfg.getInterfaceCount();i++) {
+                    UsbInterface in=cfg.getInterface(i);
+                    log(String.format(Locale.US,"  IF[%d:%d] id=%d alt=%d class=%02X sub=%02X proto=%02X endpoints=%d",
+                            ci,i,in.getId(),in.getAlternateSetting(),in.getInterfaceClass(),in.getInterfaceSubclass(),
+                            in.getInterfaceProtocol(),in.getEndpointCount()));
+                    for(int e=0;e<in.getEndpointCount();e++) {
+                        UsbEndpoint ep=in.getEndpoint(e);
+                        log(String.format(Locale.US,"   EP %02X %s type=%d packet=%d",ep.getAddress(),
+                                ep.getDirection()==UsbConstants.USB_DIR_IN?"IN":"OUT",ep.getType(),ep.getMaxPacketSize()));
+                    }
+                    if(in.getInterfaceClass()==2 && in.getInterfaceSubclass()==6 && in.getInterfaceProtocol()==0) {
+                        log("GENERIC MATCH: class=COMM subclass=ETHERNET protocol=NONE configValue="+cfg.getId());
+                        match=true;
+                    }
                 }
             }
             if(match) {
@@ -96,7 +105,11 @@ public final class MainActivity extends Activity {
         UsbDeviceConnection c=manager.openDevice(d);
         if(c==null){log("OPEN FAILED");return;}
         connection=c; log("OPEN OK fd="+c.getFileDescriptor());
-        int master=-1,slave=-1;
+        byte[] activeValue=new byte[1];
+        int activeResult=c.controlTransfer(0x80,0x08,0,0,activeValue,1,1000); // GET_CONFIGURATION
+        int activeConfigurationValue=activeResult==1?(activeValue[0]&0xFF):-1;
+        log("GET_CONFIGURATION result="+activeResult+" activeValue="+(activeConfigurationValue<0?"UNKNOWN":activeConfigurationValue));
+        int master=-1,slave=-1,targetConfigurationValue=-1;
         boolean rawDescriptors=false, cdcHeader=false, cdcEthernet=false, cdcUnion=false;
         // wValue low byte is the configuration descriptor index, not bConfigurationValue.
         // Probe every configuration because this adapter exposes a vendor-specific config
@@ -107,6 +120,9 @@ public final class MainActivity extends Activity {
             log("GET_DESCRIPTOR(CONFIG index="+cfgIndex+")="+n);
             if(n<=0) continue;
             rawDescriptors=true;
+            int rawConfigurationValue=n>=6?(raw[5]&0xFF):-1;
+            log("CONFIG descriptor index="+cfgIndex+" returned="+n+" bConfigurationValue="+rawConfigurationValue+
+                    (n>=4?" wTotalLength="+(((raw[3]&0xFF)<<8)|(raw[2]&0xFF)):""));
             int candidateMaster=-1,candidateSlave=-1;
             boolean hasCdcEtherControl=false, hasHeader=false, hasEthernet=false;
             for(int p=0;p+2<=n;) {
@@ -128,7 +144,9 @@ public final class MainActivity extends Activity {
             }
             if(hasCdcEtherControl && candidateMaster>=0) {
                 master=candidateMaster;slave=candidateSlave;
+                targetConfigurationValue=rawConfigurationValue;
                 cdcHeader=hasHeader;cdcEthernet=hasEthernet;cdcUnion=true;
+                log("ECM candidate configValue="+targetConfigurationValue+" control="+master+" data="+slave);
             }
         }
         if(!rawDescriptors)log("Raw configuration descriptor unavailable; using exposed interface descriptors only.");
@@ -139,14 +157,42 @@ public final class MainActivity extends Activity {
         }
         if(rawDescriptors)log("KERNEL-EQUIVALENT CDC validation passed: HEADER + UNION + ETHERNET.");
 
-        for(int i=0;i<d.getInterfaceCount();i++) {
-            UsbInterface in=d.getInterface(i);
+        UsbConfiguration targetConfig=null;
+        for(int ci=0;ci<d.getConfigurationCount();ci++) {
+            UsbConfiguration cfg=d.getConfiguration(ci);
+            boolean hasControl=false,hasData=false;
+            for(int i=0;i<cfg.getInterfaceCount();i++) {
+                UsbInterface in=cfg.getInterface(i);
+                if(in.getInterfaceClass()==2&&in.getInterfaceSubclass()==6&&(master<0||in.getId()==master)) hasControl=true;
+                if(in.getInterfaceClass()==10&&(slave<0||in.getId()==slave)&&hasBulkPair(in)) hasData=true;
+            }
+            if(hasControl&&hasData) {
+                if(targetConfigurationValue<0) targetConfigurationValue=cfg.getId();
+                if(cfg.getId()==targetConfigurationValue) targetConfig=cfg;
+            }
+        }
+        if(activeConfigurationValue<0) {
+            log("STOP: GET_CONFIGURATION did not return one byte. Active configuration is unverified; no interfaces claimed.");
+            return;
+        }
+        if(targetConfigurationValue<0||targetConfig==null) {
+            log("STOP: could not map CDC control/data interfaces to one configuration value. No interfaces claimed.");
+            return;
+        }
+        log("CONFIG CHECK active="+activeConfigurationValue+" targetECM="+targetConfigurationValue);
+        if(activeConfigurationValue!=targetConfigurationValue) {
+            log("STOP: CDC-ECM is not the active USB configuration. Android USB Host API has no public setConfiguration(); this probe will not claim interfaces from another configuration.");
+            return;
+        }
+
+        for(int i=0;i<targetConfig.getInterfaceCount();i++) {
+            UsbInterface in=targetConfig.getInterface(i);
             if(in.getInterfaceClass()==2&&in.getInterfaceSubclass()==6&&(master<0||in.getId()==master)) control=in;
             if(in.getInterfaceClass()==10&&(slave<0||in.getId()==slave)&&in.getAlternateSetting()>0&&hasBulkPair(in)) data=in;
         }
         if(control==null){log("No CDC Ethernet control interface; no vendor-protocol guess made.");return;}
-        if(data==null) for(int i=0;i<d.getInterfaceCount();i++){
-            UsbInterface in=d.getInterface(i);
+        if(data==null) for(int i=0;i<targetConfig.getInterfaceCount();i++){
+            UsbInterface in=targetConfig.getInterface(i);
             if(in.getInterfaceClass()==10&&hasBulkPair(in)){data=in;log("Fallback DATA interface by class + bulk pair; verify Union mapping.");break;}
         }
         if(data==null){log("No CDC DATA alternate setting with bulk IN+OUT.");return;}
@@ -164,8 +210,8 @@ public final class MainActivity extends Activity {
         boolean dc=c.claimInterface(data,true);log("CLAIM data="+dc);
         if(!dc){c.releaseInterface(control);return;}
         log("SET_INTERFACE data="+c.setInterface(data)+" alt="+data.getAlternateSetting());
-        int filter=c.controlTransfer(0x21,0x43,0x000C,control.getId(),null,0,1500);
-        log("CDC SET_ETHERNET_PACKET_FILTER directed+broadcast result="+filter+" (expected 0)");
+        int filter=c.controlTransfer(0x21,0x43,0x000E,control.getId(),null,0,1500);
+        log("CDC SET_ETHERNET_PACKET_FILTER directed+broadcast+multicast result="+filter+" (expected 0)");
         log("READY means setup succeeded, not that Ethernet RX/TX is proven.");
     }
 
@@ -189,20 +235,78 @@ public final class MainActivity extends Activity {
         f[12]=(byte)0x88;f[13]=(byte)0xB5;
         byte[] marker="CDC_PROBE_1A865394".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
         System.arraycopy(marker,0,f,14,marker.length);
-        int r=c.bulkTransfer(ep,f,f.length,1500);
+        int r=c.bulkTransfer(ep,f,f.length,200);
         log("TX EtherType=88B5 len=60 result="+r+"; positive means host USB accepted bytes, not peer delivery.");
+        if(r==f.length && ep.getMaxPacketSize()>0 && f.length%ep.getMaxPacketSize()==0) {
+            int zlp=c.bulkTransfer(ep,new byte[0],0,200);
+            log("TX ZLP result="+zlp+" because frame length is a multiple of wMaxPacketSize.");
+        }
     }
 
-    private void receiveOne(){
-        UsbDeviceConnection c=connection;UsbEndpoint ep=bulkIn;
-        if(c==null||ep==null){log("RX skipped: not configured");return;}
-        byte[] b=new byte[4096];int r=c.bulkTransfer(ep,b,b.length,1500);
-        if(r<=0){log("RX result="+r+" (timeout/error; correlate with kernel logs)");return;}
-        StringBuilder s=new StringBuilder();for(int i=0;i<Math.min(r,64);i++)s.append(String.format(Locale.US,"%02X ",b[i]&255));
-        log("RX result="+r+" first bytes="+s);
+    private void toggleRx() {
+        if (rxRunning.get()) {
+            rxRunning.set(false);
+            log("RX stop requested.");
+            return;
+        }
+        UsbDeviceConnection c=connection;
+        UsbEndpoint ep=bulkIn;
+        if(c==null||ep==null||data==null) {
+            log("RX skipped: CDC-ECM link is not configured.");
+            return;
+        }
+        if(!rxRunning.compareAndSet(false,true)) return;
+        rxQuickFailures=0;
+        rxIo.execute(() -> {
+            log("Halone-style RX loop started: synchronous bulkTransfer, timeout=20 ms, buffer=2048.");
+            byte[] frame=new byte[2048];
+            long received=0, timeouts=0, quickFailures=0, lastReport=System.nanoTime();
+            try {
+                while(rxRunning.get() && connection==c) {
+                    long started=System.nanoTime();
+                    int n=c.bulkTransfer(ep,frame,frame.length,20);
+                    long tookMs=(System.nanoTime()-started)/1_000_000L;
+                    if(n>=0) {
+                        rxQuickFailures=0;
+                        if(n>0) {
+                            received++;
+                            StringBuilder hexBytes=new StringBuilder();
+                            for(int i=0;i<Math.min(n,32);i++) hexBytes.append(String.format(Locale.US,"%02X ",frame[i]&255));
+                            String etherType=n>=14?String.format(Locale.US,"0x%04X",((frame[12]&255)<<8)|(frame[13]&255)):"short";
+                            log("RX frame len="+n+" ethertype="+etherType+" first="+hexBytes);
+                        }
+                    } else {
+                        // Halone's heuristic: quick failures can indicate a dead link;
+                        // a failure that consumed most of the timeout is treated as an ordinary timeout.
+                        if(tookMs<10) {
+                            quickFailures++;
+                            rxQuickFailures++;
+                            if(rxQuickFailures>=50) {
+                                log("RX stopping after 50 consecutive quick bulkTransfer failures; link may be gone.");
+                                break;
+                            }
+                        } else {
+                            timeouts++;
+                            rxQuickFailures=0;
+                        }
+                    }
+                    long now=System.nanoTime();
+                    if(now-lastReport>=5_000_000_000L) {
+                        log("RX stats frames="+received+" timeouts="+timeouts+" quickFailures="+quickFailures+" consecutiveQuick="+rxQuickFailures);
+                        lastReport=now;
+                    }
+                }
+            } catch(Exception e) {
+                log("RX loop exception: "+e);
+            } finally {
+                rxRunning.set(false);
+                log("Halone-style RX loop stopped frames="+received+" timeouts="+timeouts+" quickFailures="+quickFailures);
+            }
+        });
     }
 
     private void closeDevice(){
+        rxRunning.set(false);
         UsbDeviceConnection c=connection;
         if(c!=null){
             if(data!=null)try{log("RELEASE data="+c.releaseInterface(data));}catch(Exception e){log("release data: "+e);}
@@ -214,7 +318,7 @@ public final class MainActivity extends Activity {
 
     private void log(String m){runOnUiThread(()->{output.append(m+"\n");android.util.Log.i("GenericCdcProbe",m);});}
     @Override protected void onDestroy(){
-        io.execute(this::closeDevice);io.shutdown();
+        io.execute(this::closeDevice);io.shutdown();rxIo.shutdown();
         if(receiverRegistered)unregisterReceiver(permissionReceiver);
         super.onDestroy();
     }
