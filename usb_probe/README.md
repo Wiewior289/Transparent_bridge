@@ -4,7 +4,9 @@ Standalone diagnostic APK for USB adapter 1A86:5394. This module is separate fro
 
 ## Implementation
 
-- Enumerates interface class/subclass/protocol, alternate settings, and endpoints.
+- Enumerates every exposed USB configuration, interface class/subclass/protocol, alternate setting, and endpoint.
+- Reads the active configuration with standard GET_CONFIGURATION and logs each raw descriptor's `bConfigurationValue`.
+- Refuses to claim interfaces if the active configuration cannot be confirmed or if the ECM configuration is not active; Android's public USB Host API has no `setConfiguration()` method.
 - Requests the raw configuration descriptor with standard GET_DESCRIPTOR(CONFIGURATION).
 - Parses CDC functional descriptors, especially Union (master/control and slave/data).
 - Selects a CDC Ethernet control interface using class 0x02, subclass 0x06, protocol 0x00.
@@ -35,11 +37,12 @@ Install and capture logs:
 
 1. Connect adapter and tap Scan + parse CDC descriptors.
 2. Grant USB permission and save the full app log.
-3. Confirm raw configuration descriptor parsing and the CDC Union master/slave values.
-4. Confirm CLAIM control/data, SET_INTERFACE, and SET_ETHERNET_PACKET_FILTER result. Expected control-transfer return for a zero-length successful request is 0.
-5. Only when ready to transmit on the connected LAN, tap Send isolated test Ethernet frame.
-6. Test receive while a known peer is generating traffic. Idle bulk IN timeout is not proof of a bad protocol.
-7. Close the connection before returning the adapter to kernel-managed use.
+3. Compare `GET_CONFIGURATION activeValue` with `ECM candidate configValue`; these must match before the probe proceeds.
+4. Confirm raw configuration descriptor parsing and the CDC Union master/slave values.
+5. Confirm CLAIM control/data, SET_INTERFACE, and SET_ETHERNET_PACKET_FILTER result. Expected control-transfer return for a zero-length successful request is 0.
+6. Only when ready to transmit on the connected LAN, tap Send isolated test Ethernet frame.
+7. Test receive while a known peer is generating traffic. Idle bulk IN timeout is not proof of a bad protocol.
+8. Close the connection before returning the adapter to kernel-managed use.
 
 Claiming interfaces can detach cdc_ether and remove eth0 until the device/driver is reinitialized.
 
