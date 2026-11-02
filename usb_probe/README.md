@@ -11,8 +11,9 @@ Standalone diagnostic APK for USB adapter 1A86:5394. This module is separate fro
 - Parses CDC functional descriptors, especially Union (master/control and slave/data).
 - Selects a CDC Ethernet control interface using class 0x02, subclass 0x06, protocol 0x00.
 - Selects the data alternate setting containing bulk IN and bulk OUT.
-- Claims only the selected control/data interfaces, selects the data alternate setting, and sends CDC SET_ETHERNET_PACKET_FILTER with directed+broadcast bits.
-- Provides manual TX of a 60-byte broadcast Ethernet-shaped test frame (EtherType 0x88B5) and one-shot bulk IN.
+- Claims only the selected control/data interfaces, selects the data alternate setting, and sends CDC SET_ETHERNET_PACKET_FILTER `0x000E` (directed+broadcast+multicast), matching Halone.
+- Provides manual TX of a 60-byte broadcast Ethernet-shaped test frame (EtherType 0x88B5), including Halone-style ZLP when frame length is a multiple of endpoint `wMaxPacketSize`.
+- Provides a continuous Halone-style synchronous RX loop using a 2048-byte buffer, 20 ms `bulkTransfer` timeout, and the same 50-consecutive-quick-failure shutdown heuristic.
 
 No CH9200 vendor-register sequence, Realtek framing, routing, or NAT is included. Android USB Host API does not provide the kernel driver-binding mechanism or full usbnet URB queues.
 
@@ -41,7 +42,7 @@ Install and capture logs:
 4. Confirm raw configuration descriptor parsing and the CDC Union master/slave values.
 5. Confirm CLAIM control/data, SET_INTERFACE, and SET_ETHERNET_PACKET_FILTER result. Expected control-transfer return for a zero-length successful request is 0.
 6. Only when ready to transmit on the connected LAN, tap Send isolated test Ethernet frame.
-7. Test receive while a known peer is generating traffic. Idle bulk IN timeout is not proof of a bad protocol.
+7. Tap Start / stop Halone-style RX loop while a known peer is generating traffic; stop it before closing the device. Idle bulk IN timeout is not proof of a bad protocol.
 8. Close the connection before returning the adapter to kernel-managed use.
 
 Claiming interfaces can detach cdc_ether and remove eth0 until the device/driver is reinitialized.
