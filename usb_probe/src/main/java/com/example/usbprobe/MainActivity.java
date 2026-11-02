@@ -59,21 +59,27 @@ public final class MainActivity extends Activity {
     private void scan() {
         for (UsbDevice d : manager.getDeviceList().values()) {
             boolean match = d.getVendorId()==VID && d.getProductId()==PID;
-            log(String.format(Locale.US,"DEVICE %04X:%04X name=%s configurations=%d interfaces=%d",
+            log(String.format(Locale.US,"DEVICE %04X:%04X name=%s configurations=%d exposedInterfaces=%d",
                     d.getVendorId(),d.getProductId(),d.getDeviceName(),d.getConfigurationCount(),d.getInterfaceCount()));
-            for (int i=0;i<d.getInterfaceCount();i++) {
-                UsbInterface in=d.getInterface(i);
-                log(String.format(Locale.US," IF[%d] id=%d alt=%d class=%02X sub=%02X proto=%02X endpoints=%d",
-                        i,in.getId(),in.getAlternateSetting(),in.getInterfaceClass(),in.getInterfaceSubclass(),
-                        in.getInterfaceProtocol(),in.getEndpointCount()));
-                for(int e=0;e<in.getEndpointCount();e++) {
-                    UsbEndpoint ep=in.getEndpoint(e);
-                    log(String.format(Locale.US,"  EP %02X %s type=%d packet=%d",ep.getAddress(),
-                            ep.getDirection()==UsbConstants.USB_DIR_IN?"IN":"OUT",ep.getType(),ep.getMaxPacketSize()));
-                }
-                if(in.getInterfaceClass()==2 && in.getInterfaceSubclass()==6 && in.getInterfaceProtocol()==0) {
-                    log("GENERIC MATCH: class=COMM subclass=ETHERNET protocol=NONE");
-                    match=true;
+            // Enumerate every configuration. A descriptor in a non-active configuration is not usable yet.
+            for (int ci=0;ci<d.getConfigurationCount();ci++) {
+                UsbConfiguration cfg=d.getConfiguration(ci);
+                log(String.format(Locale.US," CONFIG index=%d value=%d name=%s interfaces=%d",
+                        ci,cfg.getId(),cfg.getName(),cfg.getInterfaceCount()));
+                for (int i=0;i<cfg.getInterfaceCount();i++) {
+                    UsbInterface in=cfg.getInterface(i);
+                    log(String.format(Locale.US,"  IF[%d:%d] id=%d alt=%d class=%02X sub=%02X proto=%02X endpoints=%d",
+                            ci,i,in.getId(),in.getAlternateSetting(),in.getInterfaceClass(),in.getInterfaceSubclass(),
+                            in.getInterfaceProtocol(),in.getEndpointCount()));
+                    for(int e=0;e<in.getEndpointCount();e++) {
+                        UsbEndpoint ep=in.getEndpoint(e);
+                        log(String.format(Locale.US,"   EP %02X %s type=%d packet=%d",ep.getAddress(),
+                                ep.getDirection()==UsbConstants.USB_DIR_IN?"IN":"OUT",ep.getType(),ep.getMaxPacketSize()));
+                    }
+                    if(in.getInterfaceClass()==2 && in.getInterfaceSubclass()==6 && in.getInterfaceProtocol()==0) {
+                        log("GENERIC MATCH: class=COMM subclass=ETHERNET protocol=NONE configValue="+cfg.getId());
+                        match=true;
+                    }
                 }
             }
             if(match) {
@@ -96,7 +102,11 @@ public final class MainActivity extends Activity {
         UsbDeviceConnection c=manager.openDevice(d);
         if(c==null){log("OPEN FAILED");return;}
         connection=c; log("OPEN OK fd="+c.getFileDescriptor());
-        int master=-1,slave=-1;
+        byte[] activeValue=new byte[1];
+        int activeResult=c.controlTransfer(0x80,0x08,0,0,activeValue,1,1000); // GET_CONFIGURATION
+        int activeConfigurationValue=activeResult==1?(activeValue[0]&0xFF):-1;
+        log("GET_CONFIGURATION result="+activeResult+" activeValue="+(activeConfigurationValue<0?"UNKNOWN":activeConfigurationValue));
+        int master=-1,slave=-1,targetConfigurationValue=-1;
         boolean rawDescriptors=false, cdcHeader=false, cdcEthernet=false, cdcUnion=false;
         // wValue low byte is the configuration descriptor index, not bConfigurationValue.
         // Probe every configuration because this adapter exposes a vendor-specific config
@@ -107,6 +117,9 @@ public final class MainActivity extends Activity {
             log("GET_DESCRIPTOR(CONFIG index="+cfgIndex+")="+n);
             if(n<=0) continue;
             rawDescriptors=true;
+            int rawConfigurationValue=n>=6?(raw[5]&0xFF):-1;
+            log("CONFIG descriptor index="+cfgIndex+" returned="+n+" bConfigurationValue="+rawConfigurationValue+
+                    (n>=4?" wTotalLength="+(((raw[3]&0xFF)<<8)|(raw[2]&0xFF)):""));
             int candidateMaster=-1,candidateSlave=-1;
             boolean hasCdcEtherControl=false, hasHeader=false, hasEthernet=false;
             for(int p=0;p+2<=n;) {
@@ -128,7 +141,9 @@ public final class MainActivity extends Activity {
             }
             if(hasCdcEtherControl && candidateMaster>=0) {
                 master=candidateMaster;slave=candidateSlave;
+                targetConfigurationValue=rawConfigurationValue;
                 cdcHeader=hasHeader;cdcEthernet=hasEthernet;cdcUnion=true;
+                log("ECM candidate configValue="+targetConfigurationValue+" control="+master+" data="+slave);
             }
         }
         if(!rawDescriptors)log("Raw configuration descriptor unavailable; using exposed interface descriptors only.");
@@ -139,14 +154,42 @@ public final class MainActivity extends Activity {
         }
         if(rawDescriptors)log("KERNEL-EQUIVALENT CDC validation passed: HEADER + UNION + ETHERNET.");
 
-        for(int i=0;i<d.getInterfaceCount();i++) {
-            UsbInterface in=d.getInterface(i);
+        UsbConfiguration targetConfig=null;
+        for(int ci=0;ci<d.getConfigurationCount();ci++) {
+            UsbConfiguration cfg=d.getConfiguration(ci);
+            boolean hasControl=false,hasData=false;
+            for(int i=0;i<cfg.getInterfaceCount();i++) {
+                UsbInterface in=cfg.getInterface(i);
+                if(in.getInterfaceClass()==2&&in.getInterfaceSubclass()==6&&(master<0||in.getId()==master)) hasControl=true;
+                if(in.getInterfaceClass()==10&&(slave<0||in.getId()==slave)&&hasBulkPair(in)) hasData=true;
+            }
+            if(hasControl&&hasData) {
+                if(targetConfigurationValue<0) targetConfigurationValue=cfg.getId();
+                if(cfg.getId()==targetConfigurationValue) targetConfig=cfg;
+            }
+        }
+        if(activeConfigurationValue<0) {
+            log("STOP: GET_CONFIGURATION did not return one byte. Active configuration is unverified; no interfaces claimed.");
+            return;
+        }
+        if(targetConfigurationValue<0||targetConfig==null) {
+            log("STOP: could not map CDC control/data interfaces to one configuration value. No interfaces claimed.");
+            return;
+        }
+        log("CONFIG CHECK active="+activeConfigurationValue+" targetECM="+targetConfigurationValue);
+        if(activeConfigurationValue!=targetConfigurationValue) {
+            log("STOP: CDC-ECM is not the active USB configuration. Android USB Host API has no public setConfiguration(); this probe will not claim interfaces from another configuration.");
+            return;
+        }
+
+        for(int i=0;i<targetConfig.getInterfaceCount();i++) {
+            UsbInterface in=targetConfig.getInterface(i);
             if(in.getInterfaceClass()==2&&in.getInterfaceSubclass()==6&&(master<0||in.getId()==master)) control=in;
             if(in.getInterfaceClass()==10&&(slave<0||in.getId()==slave)&&in.getAlternateSetting()>0&&hasBulkPair(in)) data=in;
         }
         if(control==null){log("No CDC Ethernet control interface; no vendor-protocol guess made.");return;}
-        if(data==null) for(int i=0;i<d.getInterfaceCount();i++){
-            UsbInterface in=d.getInterface(i);
+        if(data==null) for(int i=0;i<targetConfig.getInterfaceCount();i++){
+            UsbInterface in=targetConfig.getInterface(i);
             if(in.getInterfaceClass()==10&&hasBulkPair(in)){data=in;log("Fallback DATA interface by class + bulk pair; verify Union mapping.");break;}
         }
         if(data==null){log("No CDC DATA alternate setting with bulk IN+OUT.");return;}
