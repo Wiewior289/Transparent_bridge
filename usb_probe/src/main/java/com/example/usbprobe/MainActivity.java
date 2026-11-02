@@ -15,6 +15,9 @@ public final class MainActivity extends Activity {
     private static final String ACTION_PERMISSION = "com.example.usbprobe.USB_PERMISSION";
     private static final int VID = 0x1A86, PID = 0x5394;
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+    private final ExecutorService rxIo = Executors.newSingleThreadExecutor();
+    private final java.util.concurrent.atomic.AtomicBoolean rxRunning = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private volatile int rxQuickFailures = 0;
     private UsbManager manager;
     private TextView output;
     private UsbDevice selected;
@@ -39,7 +42,7 @@ public final class MainActivity extends Activity {
         root.setPadding(12,12,12,12); root.setOrientation(LinearLayout.VERTICAL);
         addButton(root, "1. Scan + parse CDC descriptors", v -> scan());
         addButton(root, "2. Send isolated test Ethernet frame", v -> io.execute(this::sendTest));
-        addButton(root, "3. Receive one bulk transfer (1500 ms)", v -> io.execute(this::receiveOne));
+        addButton(root, "3. Start / stop Halone-style RX loop", v -> toggleRx());
         addButton(root, "Release interfaces / close", v -> io.execute(this::closeDevice));
         output = new TextView(this); output.setTextSize(12); output.setTextIsSelectable(true);
         ScrollView scroll = new ScrollView(this); scroll.addView(output);
@@ -207,8 +210,8 @@ public final class MainActivity extends Activity {
         boolean dc=c.claimInterface(data,true);log("CLAIM data="+dc);
         if(!dc){c.releaseInterface(control);return;}
         log("SET_INTERFACE data="+c.setInterface(data)+" alt="+data.getAlternateSetting());
-        int filter=c.controlTransfer(0x21,0x43,0x000C,control.getId(),null,0,1500);
-        log("CDC SET_ETHERNET_PACKET_FILTER directed+broadcast result="+filter+" (expected 0)");
+        int filter=c.controlTransfer(0x21,0x43,0x000E,control.getId(),null,0,1500);
+        log("CDC SET_ETHERNET_PACKET_FILTER directed+broadcast+multicast result="+filter+" (expected 0)");
         log("READY means setup succeeded, not that Ethernet RX/TX is proven.");
     }
 
@@ -232,20 +235,78 @@ public final class MainActivity extends Activity {
         f[12]=(byte)0x88;f[13]=(byte)0xB5;
         byte[] marker="CDC_PROBE_1A865394".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
         System.arraycopy(marker,0,f,14,marker.length);
-        int r=c.bulkTransfer(ep,f,f.length,1500);
+        int r=c.bulkTransfer(ep,f,f.length,200);
         log("TX EtherType=88B5 len=60 result="+r+"; positive means host USB accepted bytes, not peer delivery.");
+        if(r==f.length && ep.getMaxPacketSize()>0 && f.length%ep.getMaxPacketSize()==0) {
+            int zlp=c.bulkTransfer(ep,new byte[0],0,200);
+            log("TX ZLP result="+zlp+" because frame length is a multiple of wMaxPacketSize.");
+        }
     }
 
-    private void receiveOne(){
-        UsbDeviceConnection c=connection;UsbEndpoint ep=bulkIn;
-        if(c==null||ep==null){log("RX skipped: not configured");return;}
-        byte[] b=new byte[4096];int r=c.bulkTransfer(ep,b,b.length,1500);
-        if(r<=0){log("RX result="+r+" (timeout/error; correlate with kernel logs)");return;}
-        StringBuilder s=new StringBuilder();for(int i=0;i<Math.min(r,64);i++)s.append(String.format(Locale.US,"%02X ",b[i]&255));
-        log("RX result="+r+" first bytes="+s);
+    private void toggleRx() {
+        if (rxRunning.get()) {
+            rxRunning.set(false);
+            log("RX stop requested.");
+            return;
+        }
+        UsbDeviceConnection c=connection;
+        UsbEndpoint ep=bulkIn;
+        if(c==null||ep==null||data==null) {
+            log("RX skipped: CDC-ECM link is not configured.");
+            return;
+        }
+        if(!rxRunning.compareAndSet(false,true)) return;
+        rxQuickFailures=0;
+        rxIo.execute(() -> {
+            log("Halone-style RX loop started: synchronous bulkTransfer, timeout=20 ms, buffer=2048.");
+            byte[] frame=new byte[2048];
+            long received=0, timeouts=0, quickFailures=0, lastReport=System.nanoTime();
+            try {
+                while(rxRunning.get() && connection==c) {
+                    long started=System.nanoTime();
+                    int n=c.bulkTransfer(ep,frame,frame.length,20);
+                    long tookMs=(System.nanoTime()-started)/1_000_000L;
+                    if(n>=0) {
+                        rxQuickFailures=0;
+                        if(n>0) {
+                            received++;
+                            StringBuilder hexBytes=new StringBuilder();
+                            for(int i=0;i<Math.min(n,32);i++) hexBytes.append(String.format(Locale.US,"%02X ",frame[i]&255));
+                            String etherType=n>=14?String.format(Locale.US,"0x%04X",((frame[12]&255)<<8)|(frame[13]&255)):"short";
+                            log("RX frame len="+n+" ethertype="+etherType+" first="+hexBytes);
+                        }
+                    } else {
+                        // Halone's heuristic: quick failures can indicate a dead link;
+                        // a failure that consumed most of the timeout is treated as an ordinary timeout.
+                        if(tookMs<10) {
+                            quickFailures++;
+                            rxQuickFailures++;
+                            if(rxQuickFailures>=50) {
+                                log("RX stopping after 50 consecutive quick bulkTransfer failures; link may be gone.");
+                                break;
+                            }
+                        } else {
+                            timeouts++;
+                            rxQuickFailures=0;
+                        }
+                    }
+                    long now=System.nanoTime();
+                    if(now-lastReport>=5_000_000_000L) {
+                        log("RX stats frames="+received+" timeouts="+timeouts+" quickFailures="+quickFailures+" consecutiveQuick="+rxQuickFailures);
+                        lastReport=now;
+                    }
+                }
+            } catch(Exception e) {
+                log("RX loop exception: "+e);
+            } finally {
+                rxRunning.set(false);
+                log("Halone-style RX loop stopped frames="+received+" timeouts="+timeouts+" quickFailures="+quickFailures);
+            }
+        });
     }
 
     private void closeDevice(){
+        rxRunning.set(false);
         UsbDeviceConnection c=connection;
         if(c!=null){
             if(data!=null)try{log("RELEASE data="+c.releaseInterface(data));}catch(Exception e){log("release data: "+e);}
@@ -257,7 +318,7 @@ public final class MainActivity extends Activity {
 
     private void log(String m){runOnUiThread(()->{output.append(m+"\n");android.util.Log.i("GenericCdcProbe",m);});}
     @Override protected void onDestroy(){
-        io.execute(this::closeDevice);io.shutdown();
+        io.execute(this::closeDevice);io.shutdown();rxIo.shutdown();
         if(receiverRegistered)unregisterReceiver(permissionReceiver);
         super.onDestroy();
     }
