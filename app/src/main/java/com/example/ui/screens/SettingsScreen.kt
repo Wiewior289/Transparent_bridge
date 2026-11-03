@@ -226,7 +226,7 @@ fun SettingsScreen(viewModel: PlcBridgeViewModel) {
                 SpecRow("Target Environment", "Stock ROM (Zero Root)")
                 SpecRow("Supported HMI / PLC", "Pro-face GP4000, Siemens S7, Modbus, Omron")
                 SpecRow("Transfer Software", "Pro-face GP-Pro EX 4.09 (LAN / FTPS)")
-                SpecRow("Transport Layer", "Tailscale tsnet / WireGuard (TLS 1.3)")
+                SpecRow("Transport Layer", "Tailscale userspace / WireGuard")
                 SpecRow("USB Chipsets", "Realtek RTL8152/8153, ASIX AX88179, CDC-ECM")
             }
         }
