@@ -1,8 +1,6 @@
 package com.example.usbprobe;
 
-import com.example.usbecm.CdcDescriptorScanner;
-import com.example.usbecm.CdcEcmBinder;
-import com.example.usbecm.CdcEcmProfile;
+import com.example.usbecm.UsbEcmTransport;
 
 import android.app.Activity;
 import android.app.PendingIntent;
@@ -22,15 +20,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Experimental CDC-ECM userland replay.
  *
- * Replays the CDC/usbnet host sequence for this adapter using Android USB Host:
- * - claim the CDC control + CDC data interfaces with force=true (detach cdc_ether)
- * - select the CDC data alternate setting and bulk endpoints
- * - CDC SET_ETHERNET_PACKET_FILTER
- * - bounded software RX delivery queue fed by a synchronous bulk-IN worker
- * - bounded TX frame queue and usbnet-inspired maxpacket length policy
+ * Hardware diagnostic UI using the same shared CDC-ECM discovery, bind and
+ * frame transport as the production UsbEthernetManager.
  *
- * This is deliberately not a complete Linux usbnet implementation: public Android
- * USB Host does not expose URBs, anchors, tasklets, netdev, or kernel PM primitives.
+ * RX and TX use synchronous Android bulkTransfer behind UsbEcmTransport.
+ * The bounded RX queue is only an inspection queue for the UI; ARP/ICMP probe
+ * state processing happens before queue insertion.
+ *
+ * This is not a Linux usbnet port: Android USB Host does not expose URBs,
+ * anchors, tasklets, netdev delivery or kernel runtime-PM primitives.
  */
 public final class MainActivity extends Activity {
     private static final String ACTION_PERMISSION = "com.example.usbprobe.USB_PERMISSION";
@@ -47,19 +45,13 @@ public final class MainActivity extends Activity {
     private final AtomicBoolean txWorkerStarted = new AtomicBoolean(false);
     private final ArrayBlockingQueue<byte[]> txQueue = new ArrayBlockingQueue<>(TX_QUEUE_DEPTH);
     private final ArrayBlockingQueue<byte[]> rxQueue = new ArrayBlockingQueue<>(RX_QUEUE_DEPTH);
-    private final Object connectionLock = new Object();
 
     private UsbManager manager;
     private TextView output;
     private EditText localIpInput;
     private EditText targetIpInput;
     private UsbDevice selected;
-    private UsbDeviceConnection connection;
-    private UsbInterface controlInterface;
-    private UsbInterface dataInterface;
-    private UsbEndpoint bulkIn;
-    private UsbEndpoint bulkOut;
-    private CdcEcmBinder binder;
+    private UsbEcmTransport transport;
     private final List<UsbDevice> scanCandidates = new ArrayList<>();
     private int nextCandidateIndex;
     private int maxPacket;
@@ -106,7 +98,7 @@ public final class MainActivity extends Activity {
         root.setPadding(12, 12, 12, 12);
         root.setOrientation(LinearLayout.VERTICAL);
         addButton(root, "1. Scan / acquire / replay CDC bind", v -> scan());
-        addButton(root, "2. START usbnet-style RX queue", v -> startRx());
+        addButton(root, "2. START USB Bulk IN RX worker", v -> startRx());
 
         TextView localLabel = new TextView(this);
         localLabel.setText("Probe source IPv4 (adres wolny na łączu PLC):");
@@ -193,88 +185,33 @@ public final class MainActivity extends Activity {
 
     private void openAndConfigure(UsbDevice device) {
         closeDevice();
-        UsbDeviceConnection c = manager.openDevice(device);
-        if (c == null) {
-            log("OPEN FAILED; trying next USB candidate.");
-            tryNextCandidate();
-            return;
-        }
-        synchronized (connectionLock) { connection = c; }
-        log("OPEN OK fd=" + c.getFileDescriptor());
-
-        CdcEcmProfile profile;
         try {
-            profile = new CdcDescriptorScanner(this::log).scan(c, device);
-        } catch (Exception e) {
-            log("CDC descriptor scan failed: " + e);
-            closeDevice();
-            tryNextCandidate();
-            return;
-        }
-        if (profile == null) {
-            log("No complete, unambiguous CDC-ECM function on this device. STOP.");
+            transport = UsbEcmTransport.open(manager, device, this::log);
+        } catch (Exception error) {
+            log("Shared CDC-ECM transport open failed: " + error);
             closeDevice();
             tryNextCandidate();
             return;
         }
 
-        controlInterface = profile.controlInterface;
-        dataInterface = profile.dataInterface;
-        bulkIn = profile.bulkIn;
-        bulkOut = profile.bulkOut;
-        maxPacket = bulkOut.getMaxPacketSize();
-        maxPacketIn = bulkIn.getMaxPacketSize();
-        maxSegmentSize = profile.maxSegmentSize > ETH_HLEN ? profile.maxSegmentSize : 1514;
-        macAddress = profile.macStringIndex > 0 ? readUsbString(c, profile.macStringIndex) : null;
+        maxPacket = transport.getBulkOutMaxPacketSize();
+        maxPacketIn = transport.getBulkInMaxPacketSize();
+        maxSegmentSize = transport.getMaxSegmentSize() > ETH_HLEN
+                ? transport.getMaxSegmentSize() : 1514;
+        macAddress = transport.getMacAddress();
 
-        log("CDC PROFILE configValue=" + profile.configurationValue +
-                " bcdCDC=" + String.format(Locale.US, "%04X", profile.bcdCdc) +
-                " control=" + profile.controlInterfaceNumber +
-                " data=" + profile.dataInterfaceNumber +
-                " iMAC=" + profile.macStringIndex +
-                " maxSegment=" + profile.maxSegmentSize);
-        log("CDC control IF id=" + controlInterface.getId() +
-                " alt=" + controlInterface.getAlternateSetting() +
-                " interruptEPs=" + controlInterface.getEndpointCount());
-        log("CDC data IF id=" + dataInterface.getId() +
-                " alt=" + dataInterface.getAlternateSetting() +
-                " bulk IN=0x" + hex(bulkIn.getAddress()) +
-                " OUT=0x" + hex(bulkOut.getAddress()) +
+        log("OPEN OK fd=" + transport.getFileDescriptor());
+        log("CDC PROFILE configValue=" + transport.getConfigurationValue() +
+                " control=" + transport.getControlInterfaceNumber() +
+                " data=" + transport.getDataInterfaceNumber() +
+                " alt=" + transport.getDataAlternateSetting() +
+                " bulk IN=0x" + hex(transport.getBulkInAddress()) +
+                " OUT=0x" + hex(transport.getBulkOutAddress()) +
                 " wMaxPacketSize OUT=" + maxPacket + " IN=" + maxPacketIn +
-                " maxSegment=" + maxSegmentSize);
-        log("CDC iMACAddress string=" + (macAddress == null ? "(unavailable)" : macAddress));
-        log("CONFIG NOTE: Android public USB Host APIs do not expose a reliable active-configuration query here; " +
-                "scanner resolved descriptor configurationValue=" + profile.configurationValue +
-                ". Claim/setInterface results remain the runtime test.");
-
-        binder = new CdcEcmBinder(c, profile, this::log);
-        if (!binder.bind()) {
-            closeDevice();
-            tryNextCandidate();
-            return;
-        }
-
+                " maxSegment=" + maxSegmentSize + " MAC=" + macAddress);
+        log("CDC BIND READY through shared UsbEcmTransport. This confirms descriptor validation and control setup, not peer delivery.");
         configured = true;
-        log("CDC BIND READY. This confirms descriptor validation and control setup, not successful Ethernet RX/TX.");
-        log("API-level claim success is not independent sysfs proof of usbfs ownership.");
         startTxWorker();
-    }
-
-    private String readUsbString(UsbDeviceConnection c, int index) {
-        byte[] buffer = new byte[256];
-        int result = c.controlTransfer(0x80, 0x06, 0x0300 | index, 0x0409,
-                buffer, buffer.length, 1500);
-        if (result < 4 || u8(buffer, 1) != 3) {
-            log("GET_DESCRIPTOR STRING index=" + index + " result=" + result);
-            return null;
-        }
-        int length = Math.min(u8(buffer, 0), result);
-        StringBuilder out = new StringBuilder();
-        for (int p = 2; p + 1 < length; p += 2)
-            out.append((char)(u8(buffer, p) | (u8(buffer, p + 1) << 8)));
-        String value = out.toString();
-        log("USB string index=" + index + " -> " + value);
-        return value;
     }
 
     private void startTxWorker() {
@@ -287,20 +224,18 @@ public final class MainActivity extends Activity {
                     try {
                         byte[] frame = txQueue.poll(500, TimeUnit.MILLISECONDS);
                         if (frame == null) continue;
-                        UsbDeviceConnection c = connection;
-                        UsbEndpoint endpoint = bulkOut;
-                        if (!configured || c == null || endpoint == null) continue;
-                        byte[] usbPayload = applyUsbnetTxLengthPolicy(frame);
-                        int result = c.bulkTransfer(endpoint, usbPayload, usbPayload.length, 5000);
+                        UsbEcmTransport current = transport;
+                        if (!configured || current == null || !current.isOpen()) continue;
+                        int result = current.sendFrame(frame, frame.length, 5000);
                         txSubmitted++;
-                        if (result == usbPayload.length) txCompleted++;
+                        if (result == frame.length) txCompleted++;
                         else {
                             txErrors++;
-                            log("TX completion short/error result=" + result + "/" + usbPayload.length);
+                            log("TX completion short/error result=" + result + "/" + frame.length);
                         }
-                        log("TX submit frame=" + frame.length + " USB-transfer=" + usbPayload.length +
-                                " result=" + result + " maxpacket=" + maxPacket +
-                                " policy=" + (usbPayload.length == frame.length ? "unchanged" : "usbnet-pad-byte"));
+                        log("TX frame=" + frame.length + " result=" + result +
+                                " endpoint=0x" + hex(current.getBulkOutAddress()) +
+                                " maxpacket=" + maxPacket);
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                         break;
@@ -316,21 +251,6 @@ public final class MainActivity extends Activity {
                 if (configured && txRunning) startTxWorker();
             }
         });
-    }
-
-    /**
-     * usbnet_start_xmit(): only pad a full maxpacket-multiple if the kernel driver
-     * does not use FLAG_SEND_ZLP. The generic CDC driver_info for this device must
-     * be checked to establish that flag. In our userland profile, use one-byte
-     * padding only when the adapter's binding path is confirmed to need it.
-     *
-     * For the captured adapter, 60-byte frames and maxpacket=512 do not hit this case.
-     */
-    private byte[] applyUsbnetTxLengthPolicy(byte[] frame) {
-        if (maxPacket <= 0 || frame.length % maxPacket != 0) return frame;
-        // The generic CDC binding shown in cdc_ether.c does not set a per-device
-        // FLAG_SEND_ZLP here. usbnet core therefore adds one byte on this path.
-        return Arrays.copyOf(frame, frame.length + 1);
     }
 
     private void pingPlc() {
@@ -454,21 +374,23 @@ public final class MainActivity extends Activity {
         if (rxQueue.isEmpty()) log("RX software delivery queue empty; starting receive refill.");
         rxSubmitted = rxCompleted = rxErrors = 0;
         rxExecutor.execute(() -> {
-            log("RX worker started: synchronous bulk IN transferBuffer=" + RX_TRANSFER_BUFFER_SIZE +
-                    " bytes softwareQueueDepth=" + RX_QUEUE_DEPTH +
-                    " endpoint=0x" + hex(bulkIn.getAddress()));
+            UsbEcmTransport current = transport;
+            if (current == null) {
+                rxRunning.set(false);
+                return;
+            }
+            log("RX worker started: synchronous shared Bulk IN transferBuffer=" + RX_TRANSFER_BUFFER_SIZE +
+                    " bytes inspectionQueueDepth=" + RX_QUEUE_DEPTH +
+                    " endpoint=0x" + hex(current.getBulkInAddress()));
             while (rxRunning.get()) {
-                UsbDeviceConnection c = connection;
-                UsbEndpoint endpoint = bulkIn;
-                if (!configured || c == null || endpoint == null) break;
+                current = transport;
+                if (!configured || current == null || !current.isOpen()) break;
                 byte[] transfer = new byte[RX_TRANSFER_BUFFER_SIZE];
                 int result;
                 try {
-                    // One blocking read is in flight at a time. rxQueue is a bounded
-                    // software delivery queue, not a pool of posted USB requests.
-                    int requestLength = RX_TRANSFER_BUFFER_SIZE -
-                            (RX_TRANSFER_BUFFER_SIZE % Math.max(1, maxPacketIn));
-                    result = c.bulkTransfer(endpoint, transfer, requestLength, 5000);
+                    // One blocking read is in flight at a time. UsbEcmTransport
+                    // owns endpoint selection and the maxpacket-aligned request length.
+                    result = current.receiveFrame(transfer, 5000);
                     rxSubmitted++;
                     if (result > 0) {
                         rxCompleted++;
@@ -544,16 +466,11 @@ public final class MainActivity extends Activity {
         probeGeneration++;
         txRunning = false;
         txQueue.clear();
-        UsbDeviceConnection c;
-        synchronized (connectionLock) { c = connection; connection = null; }
-        if (binder != null) {
-            try { binder.close(); } catch (Exception e) { log("CDC binder close exception=" + e); }
-            binder = null;
+        UsbEcmTransport current = transport;
+        transport = null;
+        if (current != null) {
+            try { current.close(); } catch (Exception e) { log("Shared USB transport close exception=" + e); }
         }
-        if (c != null) {
-            try { c.close(); } catch (Exception e) { log("USB close exception=" + e); }
-        }
-        controlInterface = null; dataInterface = null; bulkIn = null; bulkOut = null;
         maxPacket = 0; maxPacketIn = 0; macAddress = null;
         log("USB closed; kernel may rebind cdc_ether after usbfs releases the interface/device.");
     }
@@ -565,7 +482,6 @@ public final class MainActivity extends Activity {
         });
     }
 
-    private static int u8(byte[] bytes, int offset) { return bytes[offset] & 0xFF; }
     private static String hex(int value) { return String.format(Locale.US, "%02X", value & 0xFFFF); }
 
     @Override protected void onDestroy() {
