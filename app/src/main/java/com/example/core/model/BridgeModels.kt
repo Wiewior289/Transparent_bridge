@@ -34,11 +34,8 @@ data class EthernetConfig(
     val targetMac: String = "00:00:00:00:00:00",
     val isAutoArp: Boolean = true,
     val isMssClampingEnabled: Boolean = true,
-    val targetMss: Int = 1360,
-    val mtu: Int = 1500,
-    val isFtpsAlgEnabled: Boolean = true,
-    val dynamicPasvRangeStart: Int = 50000,
-    val dynamicPasvRangeEnd: Int = 50100
+    val targetMss: Int = 1320,
+    val mtu: Int = 1360
 )
 
 data class TailscaleConfig(
@@ -75,7 +72,7 @@ data class ArpEntry(
 data class PacketLog(
     val id: Long,
     val timestamp: Long,
-    val protocol: String, // "ARP", "IPv4", "TCP-SYN", "TCP-DATA", "UDP", "ICMP", "FTPS-PASS"
+    val protocol: String, // "ARP", "IPv4", "TCP", "UDP", "ICMP"
     val src: String,
     val dst: String,
     val length: Int,
@@ -90,6 +87,5 @@ data class PlcProfile(
     val targetIp: String,
     val vendor: String,
     val defaultPorts: List<Int>,
-    val description: String,
-    val isFtpsPasvNeeded: Boolean
+    val description: String
 )
