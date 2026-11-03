@@ -29,7 +29,7 @@ class ArpEngine(
 
     /** Updates the local IPv4 address and the static neighbour entry together. */
     @Synchronized
-    fun setAdapterIp(ip: ByteArray) {
+    fun updateAdapterIp(ip: ByteArray) {
         require(ip.size == 4) { "Adapter IPv4 address must be 4 bytes" }
         val oldIp = formatIp(adapterIp)
         arpTable[oldIp]?.takeIf { it.isStatic }?.let { arpTable.remove(oldIp, it) }
