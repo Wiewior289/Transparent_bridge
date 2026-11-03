@@ -26,6 +26,8 @@ class UserlandNatEngine(
 ) {
     companion object {
         private const val TAG = "UserlandNatEngine"
+        private const val ICMP_ECHO_REPLY = 0
+        private const val ICMP_ECHO_REQUEST = 8
         private const val SESSION_TIMEOUT_MS = 180_000L // 3 minutes idle timeout
     }
 
@@ -45,10 +47,13 @@ class UserlandNatEngine(
     // Lookup: Key (Protocol, OrigSrcIpStr, OrigSrcPort, DstPort) ➔ MasqPort
     private val natByClient = ConcurrentHashMap<String, Int>()
 
+    // ICMP Echo uses an identifier, not TCP/UDP ports. Keep its conntrack separate.
+    private val icmpByMasqId = ConcurrentHashMap<Int, NatSession>()
+
     private val portCounter = AtomicInteger(45000)
 
     val activeSessionCount: Int
-        get() = natByMasqPort.size
+        get() = natByMasqPort.size + icmpByMasqId.size
 
     fun getActiveSessions(): List<NatSession> {
         cleanExpiredSessions()
@@ -63,6 +68,8 @@ class UserlandNatEngine(
             val clientKey = "${session.protocol}:${ArpEngine.formatIp(session.origSrcIp)}:${session.origSrcPort}:${session.targetDstPort}"
             natByClient.remove(clientKey)
         }
+        val expiredIcmp = icmpByMasqId.filterValues { now - it.lastSeenMs > SESSION_TIMEOUT_MS }
+        for ((id, _) in expiredIcmp) icmpByMasqId.remove(id)
     }
 
     /**
@@ -140,8 +147,25 @@ class UserlandNatEngine(
             // 2. Perform Source IP rewrite: origSrcIp ➔ adapterIp (192.168.1.100)
             applySnat(packet, offset, ihl, l4Offset, origSrcIp, adapterIp, origSrcPort, masqPort, protocol)
             return true
-        } else if (protocol == 1) { // ICMP Echo
-            // Rewrite Source IP to 192.168.1.100 and update IP checksum
+        } else if (protocol == 1) { // ICMP Echo Request
+            val icmpOffset = offset + ihl
+            if (icmpOffset + 8 > offset + length) return false
+            if ((packet[icmpOffset].toInt() and 0xFF) != ICMP_ECHO_REQUEST ||
+                (packet[icmpOffset + 1].toInt() and 0xFF) != 0) return false
+
+            val originalId = readU16(packet, icmpOffset + 4)
+            val masqId = allocateIcmpId(originalId)
+            icmpByMasqId[masqId] = NatSession(
+                protocol = 1,
+                origSrcIp = origSrcIp,
+                origSrcPort = originalId,
+                targetDstIp = dstIp,
+                targetDstPort = 0,
+                masqPort = masqId,
+                lastSeenMs = System.currentTimeMillis()
+            )
+            updateChecksumWord(packet, icmpOffset + 2, originalId, masqId)
+            writeU16(packet, icmpOffset + 4, masqId)
             applyIpOnlySnat(packet, offset, ihl, origSrcIp, adapterIp)
             return true
         }
@@ -172,6 +196,28 @@ class UserlandNatEngine(
 
         // Only de-masquerade packets targeting our virtual adapter IP (192.168.1.100)
         if (!dstIp.contentEquals(adapterIp)) return false
+
+        if (protocol == 1) { // ICMP Echo Reply
+            val icmpOffset = offset + ihl
+            if (icmpOffset + 8 > offset + length) return false
+            if ((packet[icmpOffset].toInt() and 0xFF) != ICMP_ECHO_REPLY ||
+                (packet[icmpOffset + 1].toInt() and 0xFF) != 0) return false
+
+            val masqId = readU16(packet, icmpOffset + 4)
+            val session = icmpByMasqId[masqId] ?: run {
+                Log.w(TAG, "No ICMP NAT session for echo identifier $masqId")
+                return false
+            }
+            if (!session.targetDstIp.contentEquals(packet.copyOfRange(offset + 12, offset + 16))) {
+                Log.w(TAG, "ICMP echo reply source does not match the tracked target")
+                return false
+            }
+            session.lastSeenMs = System.currentTimeMillis()
+            updateChecksumWord(packet, icmpOffset + 2, masqId, session.origSrcPort)
+            writeU16(packet, icmpOffset + 4, session.origSrcPort)
+            applyIpOnlyDnat(packet, offset, ihl, adapterIp, session.origSrcIp)
+            return true
+        }
 
         if (protocol == 6 || protocol == 17) {
             val l4Offset = offset + ihl
@@ -234,6 +280,41 @@ class UserlandNatEngine(
         natByMasqPort[port] = session
         val clientKey = "6:${ArpEngine.formatIp(clientIp)}:$port:$port"
         natByClient[clientKey] = port
+    }
+
+    private fun allocateIcmpId(preferred: Int): Int {
+        if (preferred in 1..65535 && !icmpByMasqId.containsKey(preferred)) return preferred
+        repeat(65535) {
+            val candidate = allocatePort() and 0xFFFF
+            if (candidate != 0 && !icmpByMasqId.containsKey(candidate)) return candidate
+        }
+        throw IllegalStateException("ICMP identifier space exhausted")
+    }
+
+    private fun readU16(packet: ByteArray, offset: Int): Int =
+        ((packet[offset].toInt() and 0xFF) shl 8) or (packet[offset + 1].toInt() and 0xFF)
+
+    private fun writeU16(packet: ByteArray, offset: Int, value: Int) {
+        packet[offset] = ((value ushr 8) and 0xFF).toByte()
+        packet[offset + 1] = (value and 0xFF).toByte()
+    }
+
+    /** Incremental one's-complement checksum update for one 16-bit ICMP word. */
+    private fun updateChecksumWord(packet: ByteArray, checksumOffset: Int, oldWord: Int, newWord: Int) {
+        val checksum = readU16(packet, checksumOffset)
+        writeU16(packet, checksumOffset, ChecksumUtils.updateChecksum16(checksum, oldWord, newWord))
+    }
+
+    private fun applyIpOnlyDnat(packet: ByteArray, ipOffset: Int, ihl: Int, oldIp: ByteArray, newIp: ByteArray) {
+        val checksum = readU16(packet, ipOffset + 10)
+        val oldWord1 = readU16(oldIp, 0)
+        val oldWord2 = readU16(oldIp, 2)
+        val newWord1 = readU16(newIp, 0)
+        val newWord2 = readU16(newIp, 2)
+        var updated = ChecksumUtils.updateChecksum16(checksum, oldWord1, newWord1)
+        updated = ChecksumUtils.updateChecksum16(updated, oldWord2, newWord2)
+        writeU16(packet, ipOffset + 10, updated)
+        System.arraycopy(newIp, 0, packet, ipOffset + 16, 4)
     }
 
     private fun allocatePort(): Int {
