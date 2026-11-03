@@ -400,7 +400,7 @@ class PlcBridgeService : Service() {
                 if (replyFrame != null) {
                     if (transmitEthernetFrame(replyFrame, "ARP reply to $senderIp")) {
                         logPacket("ARP-REP", ethernetConfig.adapterIp, senderIp, replyFrame.size,
-                            "Is-at ${ethernetConfig.virtualMac}", "", false)
+                            "Is-at ${ArpEngine.formatMac(arpEngine.virtualMac)}", "", false)
                     }
                 }
 
