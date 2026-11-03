@@ -255,7 +255,6 @@ class PlcBridgeViewModel(application: Application) : AndroidViewModel(applicatio
                 vendor = "Mitsubishi Electric",
                 defaultPorts = listOf(5007, 1025),
                 description = "SLMP / MC Protocol 3E/4E binary frame communications for GX Works3",
-                isFtpsPasvNeeded = false
             )
         )
     }
