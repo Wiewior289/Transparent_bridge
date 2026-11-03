@@ -27,6 +27,18 @@ class ArpEngine(
 
     fun getArpTable(): List<ArpEntry> = arpTable.values.toList()
 
+    /**
+     * Replaces the provisional MAC with the adapter's actual CDC-ECM iMACAddress.
+     * virtualMac is a retained mutable byte array so frame builders see the same value.
+     */
+    @Synchronized
+    fun setVirtualMac(mac: ByteArray) {
+        require(mac.size == 6 && isUsableUnicastMac(mac)) { "Adapter MAC must be a unicast 6-byte address" }
+        System.arraycopy(mac, 0, virtualMac, 0, 6)
+        val ip = formatIp(adapterIp)
+        arpTable[ip] = ArpEntry(ip, formatMac(virtualMac), isStatic = true, isResolved = true)
+    }
+
     fun setStaticArp(ip: String, mac: String) {
         arpTable[ip] = ArpEntry(ip, mac, isStatic = true, isResolved = true)
     }
