@@ -402,7 +402,7 @@ public final class MainActivity extends Activity {
             final int generation = probeGeneration;
             probeSentNanos = System.nanoTime();
             log("ARP PASS: " + EthernetProbe.formatIpv4(probeTargetIp) +
-                    " is-at " + mac(peer) + "; constructing IPv4 ICMP Echo Request.");
+                    " is-at " + mac(peer, 0) + "; constructing IPv4 ICMP Echo Request.");
 
             byte[] echo = EthernetProbe.buildIcmpEchoRequest(
                     probeLocalMac, peer, probeLocalIp, probeTargetIp,
@@ -427,7 +427,7 @@ public final class MainActivity extends Activity {
             probeGeneration++;
             log("PING PASS: ICMP Echo Reply " + EthernetProbe.formatIpv4(probeTargetIp) +
                     " -> " + EthernetProbe.formatIpv4(probeLocalIp) +
-                    " peerMAC=" + mac(probePeerMac) + " rtt=" + rttMs + " ms" +
+                    " peerMAC=" + mac(probePeerMac, 0) + " rtt=" + rttMs + " ms" +
                     "; IPv4 and ICMP checksums valid.");
         }
     }
@@ -439,7 +439,7 @@ public final class MainActivity extends Activity {
             log("PING FAIL: ARP timeout for " + EthernetProbe.formatIpv4(probeTargetIp) +
                     ". No matching ARP reply reached USB bulk IN.");
         } else {
-            log("PING FAIL: ARP resolved to " + mac(probePeerMac) +
+            log("PING FAIL: ARP resolved to " + mac(probePeerMac, 0) +
                     " but no matching ICMP Echo Reply reached USB bulk IN.");
         }
     }
