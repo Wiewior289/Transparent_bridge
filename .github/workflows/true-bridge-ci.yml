@@ -1,0 +1,57 @@
+name: TRUE_BRIDGE CI
+
+on:
+  push:
+    branches:
+      - true_bridge
+    paths:
+      - 'app/**'
+      - 'usb_ecm/**'
+      - 'usb_probe/**'
+      - 'gradle/**'
+      - 'settings.gradle.kts'
+      - 'build.gradle.kts'
+      - '.github/workflows/true-bridge-ci.yml'
+  pull_request:
+    paths:
+      - 'app/**'
+      - 'usb_ecm/**'
+      - 'usb_probe/**'
+      - 'gradle/**'
+      - 'settings.gradle.kts'
+      - 'build.gradle.kts'
+      - '.github/workflows/true-bridge-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Test USB probe packet logic
+        run: gradle :usb_probe:testDebugUnitTest --no-configuration-cache
+
+      - name: Build shared CDC-ECM library
+        run: gradle :usb_ecm:assembleDebug --no-configuration-cache
+
+      - name: Build USB probe APK
+        run: gradle :usb_probe:assembleDebug --no-configuration-cache
+
+      - name: Build production bridge APK
+        run: gradle :app:assembleDebug --no-configuration-cache
