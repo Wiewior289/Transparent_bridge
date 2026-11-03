@@ -20,3 +20,7 @@ android {
         release { isMinifyEnabled = false }
     }
 }
+
+dependencies {
+    testImplementation(libs.junit)
+}
