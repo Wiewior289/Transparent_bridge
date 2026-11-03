@@ -495,11 +495,6 @@ class PlcBridgeService : Service() {
         }
     }
 
-    // Compatibility name retained for the UI; this is an ARP who-has probe, not gratuitous ARP.
-    fun sendGratuitousArp() {
-        sendArpRequestFor(ethernetConfig.targetPlcIp)
-    }
-
     fun sendArpRequestFor(targetIp: String) {
         serviceScope.launch {
             val req = arpEngine.buildArpRequest(ArpEngine.parseIp(targetIp))
@@ -509,7 +504,7 @@ class PlcBridgeService : Service() {
     }
 
     fun probePlc() {
-        sendGratuitousArp()
+        sendArpRequestFor(ethernetConfig.targetPlcIp)
     }
 
     fun logPacket(protocol: String, src: String, dst: String, length: Int, info: String, hexPreview: String, isClamped: Boolean) {
