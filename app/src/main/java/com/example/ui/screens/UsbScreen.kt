@@ -307,7 +307,7 @@ fun UsbScreen(viewModel: PlcBridgeViewModel) {
                             tint = IndustrialAmber
                         )
                     }
-                    IconButton(onClick = { viewModel.sendGratuitousArp() }) {
+                    IconButton(onClick = { viewModel.probePlc() }) {
                         Icon(
                             imageVector = Icons.Default.ElectricalServices,
                             contentDescription = "Probe ARP",
