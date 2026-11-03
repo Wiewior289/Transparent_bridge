@@ -272,7 +272,7 @@ class PlcBridgeService : Service() {
                     false
                 )
 
-                sendGratuitousArp()
+                probePlc()
             } catch (e: CancellationException) {
                 usbManager.disconnect()
                 tailscaleManager.stopSubnetRouter()
@@ -293,20 +293,26 @@ class PlcBridgeService : Service() {
     /**
      * Handles outgoing IPv4 packets from TUN / Tailscale / Host.
      * Applies validated Userland SNAT (Masquerade) to the USB adapter address and clamps TCP MSS to the effective MTU,
-     * encapsulates in 14-byte Ethernet frame, and sends to USB Bulk OUT.
+     * encapsulates in an Ethernet frame, and sends to USB Bulk OUT.
      */
     fun handleOutgoingIpPacketFromTun(packet: ByteArray, length: Int) {
         if (length < 20 || length > packet.size) {
             totalDroppedPackets.incrementAndGet()
             return
         }
+        val ipLength = ((packet[2].toInt() and 0xFF) shl 8) or (packet[3].toInt() and 0xFF)
+        if (ipLength < 20 || ipLength > length) {
+            totalDroppedPackets.incrementAndGet()
+            Log.w(TAG, "TUN packet rejected: IPv4 Total Length=$ipLength available=$length")
+            return
+        }
         val origSrc = ArpEngine.formatIp(packet, 12)
         val targetDst = ArpEngine.formatIp(packet, 16)
 
         // SNAT validates IPv4 and the supported transport before any frame is emitted.
-        if (!natEngine.processOutgoingPacket(packet, 0, length)) {
+        if (!natEngine.processOutgoingPacket(packet, 0, ipLength)) {
             totalDroppedPackets.incrementAndGet()
-            logPacket("IP-DROP", origSrc, targetDst, length, "Unsupported or invalid IPv4 flow", "", false)
+            logPacket("IP-DROP", origSrc, targetDst, ipLength, "Unsupported or invalid IPv4 flow", "", false)
             return
         }
 
@@ -317,18 +323,18 @@ class PlcBridgeService : Service() {
             1 -> "ICMP-OUT"
             else -> "IP-OUT"
         }
-        logPacket(protoStr, origSrc, targetDst, length,
+        logPacket(protoStr, origSrc, targetDst, ipLength,
             "SNAT -> ${ethernetConfig.adapterIp}", "", false)
 
         val dstMac = arpEngine.getMacForIp(targetDst)
         if (dstMac != null) {
-            val frame = arpEngine.wrapInEthernetHeader(packet, 0, length, dstMac)
+            val frame = arpEngine.wrapInEthernetHeader(packet, 0, ipLength, dstMac)
             transmitEthernetFrame(frame, "IPv4 -> $targetDst")
         } else {
             Log.i(TAG, "ARP cache miss for $targetDst. Queueing packet and resolving peer MAC.")
-            if (!arpEngine.queuePendingPacket(targetDst, packet.copyOfRange(0, length))) {
+            if (!arpEngine.queuePendingPacket(targetDst, packet.copyOfRange(0, ipLength))) {
                 totalDroppedPackets.incrementAndGet()
-                logPacket("IP-DROP", origSrc, targetDst, length, "ARP pending queue full", "", false)
+                logPacket("IP-DROP", origSrc, targetDst, ipLength, "ARP pending queue full", "", false)
                 return
             }
             sendArpRequestFor(targetDst)
@@ -380,6 +386,11 @@ class PlcBridgeService : Service() {
 
         when (etherType) {
             0x0806 -> { // ARP Frame
+                if (length < 42) {
+                    totalDroppedPackets.incrementAndGet()
+                    Log.w(TAG, "Dropping undersized ARP frame len=$length")
+                    return
+                }
                 val senderIp = ArpEngine.formatIp(frame, 28)
                 val targetIp = ArpEngine.formatIp(frame, 38)
                 val replyFrame = arpEngine.processIncomingFrame(frame, length)
