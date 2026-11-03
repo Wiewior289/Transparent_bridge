@@ -38,7 +38,7 @@ class UsbEthernetManager(private val context: Context) {
 
     val fileDescriptor: Int?
         get() = try {
-            activeConnection?.fileDescriptor
+            cdcTransport?.getFileDescriptor() ?: activeConnection?.fileDescriptor
         } catch (_: Exception) {
             null
         }
