@@ -1,5 +1,9 @@
 package com.example.usbprobe;
 
+import com.example.usbecm.CdcDescriptorScanner;
+import com.example.usbecm.CdcEcmBinder;
+import com.example.usbecm.CdcEcmProfile;
+
 import android.app.Activity;
 import android.app.PendingIntent;
 import android.content.*;
