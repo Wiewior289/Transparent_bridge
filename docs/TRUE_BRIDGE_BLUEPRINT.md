@@ -71,10 +71,11 @@ Status implementacji: wspólny moduł oraz integracja app i probe są w gałęzi
 
 ### Etap 2 — transport i lifecycle
 - Jeden właściciel połączenia USB.
-- Liczniki RX/TX frames, bytes, błędów, timeoutów (o ile API pozwala je rozdzielić), malformed frames, drop i disconnect.
+- Liczniki RX/TX frames, bytes, błędów, negatywnych completion (timeout lub błąd I/O bez rozróżnienia przez publiczne API), wyjątków I/O, malformed frames, drop i disconnect.
+- Serializacja zapisów do wspólnego endpointu Bulk OUT; zamknięcie transportu czeka na zakończenie operacji RX/TX już znajdujących się w toku.
 - Testy reconnect, permission revoke, close/release.
 - Nie stosować ZLP/pad heurystyki bez pomiaru dla danego adaptera.
-Status implementacji: synchroniczny transport ma jeden właścicielski lifecycle i podstawowe liczniki. Długotrwały soak, permission revoke i unplug/replug pozostają testami laboratoryjnymi. API bulkTransfer nie rozróżnia wiarygodnie timeoutu od błędu I/O.
+Status implementacji: synchroniczny transport ma jeden właścicielski lifecycle i podstawowe liczniki. Ujęto liczniki negatywnych completion i oddzielne wyjątki I/O; testy jednostkowe klasyfikacji wyników RX są w CI. Zapisy Bulk OUT są serializowane, a close synchronizuje się z operacjami w toku. Długotrwały soak, permission revoke i unplug/replug pozostają testami laboratoryjnymi. API bulkTransfer nie rozróżnia wiarygodnie timeoutu od błędu I/O.
 
 ### Etap 3 — IPv4 i conntrack bez ALG
 - Walidacja Version, IHL, Total Length, header checksum i granic nagłówków.
@@ -122,7 +123,7 @@ Gate: raport throughput, RTT, loss, CPU, temperatury.
 | wspólny transport używany przez app i probe | zaimplementowany; CI i test WCH/PLC wymagane |
 | produkcyjny packet pipeline | częściowo zintegrowany; wymaga testu end-to-end |
 | full-tuple NAT / ICMP reverse | zaimplementowany; testy jednostkowe dodane, CI do potwierdzenia |
-| FTP/FTPS ALG | usunięty z modelu, usługi, UI i kodu proxy |
+| FTP/FTPS ALG | usunięty z modelu, usług, UI i kodu proxy |
 | UsbRequest | późniejszy etap |
 | Tailscale end-to-end z PLC | niepotwierdzone sprzętowo |
 
