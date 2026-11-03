@@ -13,7 +13,7 @@ import java.util.Locale
 /**
  * Tailscale Subnet Router Controller.
  * 
- * Direct JNI interface to the Go tsnet + gVisor netstack core in /app/src/main/go/bridge.go.
+ * Direct JNI interface to the embedded Tailscale userspace engine (wgengine + ipnlocal) in /app/src/main/go/bridge.go.
  * No HTTP client emulation or random IP generation.
  */
 class TailscaleSubnetManager(private val context: Context? = null) {
@@ -56,7 +56,7 @@ class TailscaleSubnetManager(private val context: Context? = null) {
     }
 
     /**
-     * Starts the native Go tsnet daemon via JNI with gVisor netstack and subnet routes.
+     * Starts the native Tailscale userspace engine via JNI and configures advertised subnet routes.
      */
     fun startSubnetRouter(authKey: String, nodeName: String, routes: String) {
         val trimmedKey = authKey.trim().ifEmpty { prefs?.getString("auth_key", "") ?: "" }
@@ -69,7 +69,7 @@ class TailscaleSubnetManager(private val context: Context? = null) {
             ?.apply()
 
         log("══════════════════════════════════════════════")
-        log("Invoking native Go tsnet daemon (bridge.go) via JNI...")
+        log("Starting embedded Tailscale userspace backend (wgengine/ipnlocal) via JNI...")
         log("Node: $nodeName | Subnet: $routes")
         log("Data directory: $dataDir")
 
@@ -86,7 +86,7 @@ class TailscaleSubnetManager(private val context: Context? = null) {
 
         if (TailscaleBridgeJni.isLibraryLoaded) {
             try {
-                log("Calling TailscaleBridgeJni.startTsnet() in Go runtime...")
+                log("Calling TailscaleBridgeJni.startTsnet() for the embedded userspace backend...")
                 val res = TailscaleBridgeJni.startTsnet(trimmedKey, nodeName, routes, dataDir)
                 if (res > 0) {
                     val tailnetIp = TailscaleBridgeJni.getAssignedTailnetIp()
@@ -95,13 +95,13 @@ class TailscaleSubnetManager(private val context: Context? = null) {
                         tailnetIp = tailnetIp,
                         isSubnetRoutingActive = true
                     )
-                    log("SUCCESS: tsnet.Server running in RAM via gVisor netstack!")
+                    log("SUCCESS: embedded Tailscale userspace engine started; packet I/O is connected through UserlandTun/JNI.")
                     log("Assigned Tailnet IP: $tailnetIp")
                 } else if (res == 0) {
                     log("tsnet.Server is already running in RAM.")
                     _config.value = _config.value.copy(isConnected = true, isSubnetRoutingActive = true)
                 } else {
-                    log("ERROR: tsnet.Server.Start() returned error code $res")
+                    log("ERROR: embedded Tailscale userspace backend returned error code $res")
                 }
             } catch (e: UnsatisfiedLinkError) {
                 log("JNI Linkage error: ${e.message}")
@@ -146,7 +146,7 @@ class TailscaleSubnetManager(private val context: Context? = null) {
                 log("Error stopping tsnet daemon: ${e.message}")
             }
         }
-        log("Tailscale tsnet daemon stopped.")
+        log("Embedded Tailscale userspace backend stopped.")
         _config.value = _config.value.copy(
             isConnected = false,
             isSubnetRoutingActive = false
