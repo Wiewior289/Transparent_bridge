@@ -224,6 +224,13 @@ class PlcBridgeService : Service() {
                     )
                 }
 
+                // For CDC-ECM, Ethernet frames must use the MAC advertised by
+                // the adapter's CDC iMACAddress descriptor, not a synthetic UI default.
+                usbManager.adapterMacAddress?.let { mac ->
+                    arpEngine.setVirtualMac(ArpEngine.parseMac(mac))
+                    Log.i(TAG, "Using adapter hardware MAC for Ethernet/ARP: $mac")
+                } ?: Log.w(TAG, "USB backend did not expose a hardware MAC; configured fallback MAC remains active.")
+
                 currentCoroutineContext().ensureActive()
 
                 if (TailscaleBridgeJni.isLibraryLoaded) {
