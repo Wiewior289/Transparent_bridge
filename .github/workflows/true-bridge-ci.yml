@@ -23,6 +23,10 @@ on:
       - '.github/workflows/true-bridge-ci.yml'
   workflow_dispatch:
 
+concurrency:
+  group: true-bridge-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
