@@ -49,7 +49,7 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --version
 
       - name: Install Android NDK
-        run: sdkmanager --install "ndk;29.0.14206865"
+        run: "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;29.0.14206865"
 
       - name: Build embedded Tailscale JNI library
         working-directory: app/src/main/go
