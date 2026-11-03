@@ -301,17 +301,14 @@ class PlcBridgeService : Service() {
                 // LocalBackend.Start() is asynchronous with respect to tailnet login.
                 // Do not call the USB bridge RUNNING until Tailscale reports Running + a real IP.
                 val tailnetState = withTimeoutOrNull(45_000L) {
-                    tailscaleManager.config.first { state ->
-                        state.isConnected ||
-                            state.backendState == "NeedsLogin" ||
-                            state.backendState == "NeedsMachineAuth" ||
-                            state.backendState == "STOPPED"
-                    }
+                    // NeedsLogin is not terminal: the native backend may still be
+                    // processing StartLoginInteractive and transitioning to Running.
+                    tailscaleManager.config.first { it.isConnected }
                 }
-                if (tailnetState?.isConnected != true) {
+                if (tailnetState == null) {
                     val current = tailscaleManager.config.value
                     throw IllegalStateException(
-                        "Tailscale is not ready: state=${current.backendState}, tailnetIp=${current.tailnetIp}"
+                        "Tailscale did not reach Running within 45s: state=${current.backendState}, tailnetIp=${current.tailnetIp}"
                     )
                 }
 
