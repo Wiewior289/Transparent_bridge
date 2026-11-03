@@ -8,8 +8,8 @@ android {
         applicationId = "com.example.usbprobe"
         minSdk = 24
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2-cdc-userland-replay"
+        versionCode = 3
+        versionName = "0.3-arp-icmp-probe"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
