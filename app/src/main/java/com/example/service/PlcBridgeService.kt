@@ -95,14 +95,17 @@ class PlcBridgeService : Service() {
     private val packetIdCounter = AtomicLong(0L)
     val totalRxBytes = AtomicLong(0L)
     val totalTxBytes = AtomicLong(0L)
-    val totalPackets = AtomicLong(0L)
+    val totalRxPackets = AtomicLong(0L)
+    val totalTxPackets = AtomicLong(0L)
+    val totalDroppedPackets = AtomicLong(0L)
 
     private var rxJob: Job? = null
     private var statsJob: Job? = null
 
     private var lastRxBytes = 0L
     private var lastTxBytes = 0L
-    private var lastPackets = 0L
+    private var lastRxPackets = 0L
+    private var lastTxPackets = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -286,35 +289,60 @@ class PlcBridgeService : Service() {
      * encapsulates in 14-byte Ethernet frame, and sends to USB Bulk OUT.
      */
     fun handleOutgoingIpPacketFromTun(packet: ByteArray, length: Int) {
-        if (length < 20) return
+        if (length < 20 || length > packet.size) {
+            totalDroppedPackets.incrementAndGet()
+            return
+        }
         val origSrc = ArpEngine.formatIp(packet, 12)
         val targetDst = ArpEngine.formatIp(packet, 16)
 
-        // 1. Apply Userland SNAT Masquerade (rewrite source IP to 192.168.1.100)
-        val snatSuccess = natEngine.processOutgoingPacket(packet, 0, length)
-        if (!snatSuccess) return
-
-        totalTxBytes.addAndGet(length.toLong())
-        totalPackets.incrementAndGet()
+        // SNAT validates IPv4 and the supported transport before any frame is emitted.
+        if (!natEngine.processOutgoingPacket(packet, 0, length)) {
+            totalDroppedPackets.incrementAndGet()
+            logPacket("IP-DROP", origSrc, targetDst, length, "Unsupported or invalid IPv4 flow", "", false)
+            return
+        }
 
         val protoNum = packet[9].toInt() and 0xFF
-        val protoStr = if (protoNum == 6) "TCP-OUT" else if (protoNum == 17) "UDP-OUT" else "IP-OUT"
-        logPacket(protoStr, origSrc, targetDst, length, "SNAT Masquerade ➔ ${ethernetConfig.adapterIp}", "", false)
+        val protoStr = when (protoNum) {
+            6 -> "TCP-OUT"
+            17 -> "UDP-OUT"
+            1 -> "ICMP-OUT"
+            else -> "IP-OUT"
+        }
+        logPacket(protoStr, origSrc, targetDst, length,
+            "SNAT -> ${ethernetConfig.adapterIp}", "", false)
 
-        // 2. Lookup MAC in ARP table
         val dstMac = arpEngine.getMacForIp(targetDst)
         if (dstMac != null) {
-            // Target MAC is known: wrap and send immediately
             val frame = arpEngine.wrapInEthernetHeader(packet, 0, length, dstMac)
-            if (usbManager.isConnected) {
-                usbManager.sendFrame(frame, frame.size)
-            }
+            transmitEthernetFrame(frame, "IPv4 -> $targetDst")
         } else {
-            // Target MAC unknown: queue packet and broadcast ARP Request
-            Log.i(TAG, "ARP cache miss for $targetDst. Queuing packet and sending who-has query...")
-            arpEngine.queuePendingPacket(targetDst, packet.copyOfRange(0, length))
+            Log.i(TAG, "ARP cache miss for $targetDst. Queueing packet and resolving peer MAC.")
+            if (!arpEngine.queuePendingPacket(targetDst, packet.copyOfRange(0, length))) {
+                totalDroppedPackets.incrementAndGet()
+                logPacket("IP-DROP", origSrc, targetDst, length, "ARP pending queue full", "", false)
+                return
+            }
             sendArpRequestFor(targetDst)
         }
+    }
+
+    private fun transmitEthernetFrame(frame: ByteArray, description: String): Boolean {
+        if (!usbManager.isConnected) {
+            totalDroppedPackets.incrementAndGet()
+            Log.w(TAG, "TX drop: USB transport is not connected ($description)")
+            return false
+        }
+        val result = usbManager.sendFrame(frame, frame.size)
+        if (result != frame.size) {
+            totalDroppedPackets.incrementAndGet()
+            Log.w(TAG, "TX incomplete: result=$result expected=${frame.size} ($description)")
+            return false
+        }
+        totalTxBytes.addAndGet(frame.size.toLong())
+        totalTxPackets.incrementAndGet()
+        return true
     }
 
     private fun startRxLoop() {
@@ -326,7 +354,7 @@ class PlcBridgeService : Service() {
                     val bytesRead = usbManager.receiveFrame(rxBuffer, 20)
                     if (bytesRead > 0) {
                         totalRxBytes.addAndGet(bytesRead.toLong())
-                        totalPackets.incrementAndGet()
+                        totalRxPackets.incrementAndGet()
                         handleIncomingEthernetFrame(rxBuffer, bytesRead)
                     }
                 } else {
@@ -337,7 +365,10 @@ class PlcBridgeService : Service() {
     }
 
     private fun handleIncomingEthernetFrame(frame: ByteArray, length: Int) {
-        if (length < 14) return
+        if (length < 14) {
+            totalDroppedPackets.incrementAndGet()
+            return
+        }
         val etherType = ((frame[12].toInt() and 0xFF) shl 8) or (frame[13].toInt() and 0xFF)
 
         when (etherType) {
@@ -347,10 +378,12 @@ class PlcBridgeService : Service() {
                 val replyFrame = arpEngine.processIncomingFrame(frame, length)
                 logPacket("ARP", senderIp, targetIp, length, "Who-has $targetIp", bytesToHex(frame, 0, minOf(length, 32)), false)
 
-                // If someone asked for 192.168.1.100, send synthetic reply
-                if (replyFrame != null && usbManager.isConnected) {
-                    usbManager.sendFrame(replyFrame, replyFrame.size)
-                    logPacket("ARP-REP", ethernetConfig.adapterIp, senderIp, replyFrame.size, "Is-at ${ethernetConfig.virtualMac}", "", false)
+                // Respond to an ARP request for our configured adapter IP.
+                if (replyFrame != null) {
+                    if (transmitEthernetFrame(replyFrame, "ARP reply to $senderIp")) {
+                        logPacket("ARP-REP", ethernetConfig.adapterIp, senderIp, replyFrame.size,
+                            "Is-at ${ethernetConfig.virtualMac}", "", false)
+                    }
                 }
 
                 // Check if any pending packets were waiting for senderIp's MAC!
@@ -359,8 +392,7 @@ class PlcBridgeService : Service() {
                     val pending = arpEngine.getAndClearPendingPackets(senderIp)
                     for (pendingIpPacket in pending) {
                         val outFrame = arpEngine.wrapInEthernetHeader(pendingIpPacket, 0, pendingIpPacket.size, senderMac)
-                        if (usbManager.isConnected) {
-                            usbManager.sendFrame(outFrame, outFrame.size)
+                        if (transmitEthernetFrame(outFrame, "queued IPv4 -> $senderIp")) {
                             Log.i(TAG, "Flushed queued IP packet (${pendingIpPacket.size}B) to $senderIp")
                         }
                     }
@@ -368,31 +400,52 @@ class PlcBridgeService : Service() {
             }
             0x0800 -> { // IPv4 Packet
                 val ipOffset = 14
-                val ipLen = length - 14
-                val ipPacket = ByteArray(ipLen)
-                System.arraycopy(frame, ipOffset, ipPacket, 0, ipLen)
+                val frameIpBytes = length - ipOffset
+                if (frameIpBytes < 20) {
+                    totalDroppedPackets.incrementAndGet()
+                    return
+                }
+
+                // Ethernet frames may contain padding. The TUN receives exactly IPv4 Total Length.
+                val ipTotalLength = ((frame[ipOffset + 2].toInt() and 0xFF) shl 8) or
+                    (frame[ipOffset + 3].toInt() and 0xFF)
+                if (ipTotalLength < 20 || ipTotalLength > frameIpBytes) {
+                    totalDroppedPackets.incrementAndGet()
+                    logPacket("IP-DROP", "0.0.0.0", "0.0.0.0", frameIpBytes,
+                        "Invalid IPv4 Total Length=$ipTotalLength", "", false)
+                    return
+                }
+                val ipPacket = ByteArray(ipTotalLength)
+                System.arraycopy(frame, ipOffset, ipPacket, 0, ipTotalLength)
 
                 val srcIp = ArpEngine.formatIp(ipPacket, 12)
                 val dstIp = ArpEngine.formatIp(ipPacket, 16)
 
-                // Apply Reverse Userland DNAT (Demangle destination 192.168.1.100 back to host IP)
-                val dnatSuccess = natEngine.processIncomingPacket(ipPacket, 0, ipLen)
-                if (dnatSuccess) {
-                    val restoredDst = ArpEngine.formatIp(ipPacket, 16)
-                    val protoNum = ipPacket[9].toInt() and 0xFF
-                    val protoStr = if (protoNum == 6) "TCP-IN" else if (protoNum == 17) "UDP-IN" else "IP-IN"
-                    logPacket(protoStr, srcIp, restoredDst, ipLen, "DNAT De-masquerade ➔ $restoredDst", "", false)
-
-                    // Inject de-masqueraded packet directly to Tailscale Go daemon (single authoritative path)
-                    val injected = tailscaleManager.injectPacketFromUsb(ipPacket, ipLen)
-                    if (injected != ipLen) {
-                        Log.w(TAG, "Tailscale rejected USB packet: result=$injected, length=$ipLen")
-                    }
-                } else {
-                    logPacket("IP-DROP", srcIp, dstIp, ipLen, "No NAT session mapping found", "", false)
+                if (!natEngine.processIncomingPacket(ipPacket, 0, ipTotalLength)) {
+                    totalDroppedPackets.incrementAndGet()
+                    logPacket("IP-DROP", srcIp, dstIp, ipTotalLength,
+                        "No exact reverse NAT flow or invalid IPv4 packet", "", false)
+                    return
                 }
 
+                val restoredDst = ArpEngine.formatIp(ipPacket, 16)
+                val protoNum = ipPacket[9].toInt() and 0xFF
+                val protoStr = when (protoNum) {
+                    6 -> "TCP-IN"
+                    17 -> "UDP-IN"
+                    1 -> "ICMP-IN"
+                    else -> "IP-IN"
+                }
+                logPacket(protoStr, srcIp, restoredDst, ipTotalLength,
+                    "DNAT -> $restoredDst", "", false)
+
+                val injected = tailscaleManager.injectPacketFromUsb(ipPacket, ipTotalLength)
+                if (injected != ipTotalLength) {
+                    totalDroppedPackets.incrementAndGet()
+                    Log.w(TAG, "Tailscale rejected USB packet: result=$injected, length=$ipTotalLength")
+                }
             }
+            else -> totalDroppedPackets.incrementAndGet()
         }
     }
 
@@ -403,23 +456,28 @@ class PlcBridgeService : Service() {
                 delay(1000)
                 val rx = totalRxBytes.get()
                 val tx = totalTxBytes.get()
-                val pkts = totalPackets.get()
+                val rxPackets = totalRxPackets.get()
+                val txPackets = totalTxPackets.get()
+                val dropped = totalDroppedPackets.get()
                 val activeConns = natEngine.activeSessionCount
 
                 val rxDelta = (rx - lastRxBytes).coerceAtLeast(0L)
                 val txDelta = (tx - lastTxBytes).coerceAtLeast(0L)
-                val pps = (pkts - lastPackets).coerceAtLeast(0L).toInt()
+                val rxPacketDelta = (rxPackets - lastRxPackets).coerceAtLeast(0L)
+                val txPacketDelta = (txPackets - lastTxPackets).coerceAtLeast(0L)
+                val pps = (rxPacketDelta + txPacketDelta).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
                 lastRxBytes = rx
                 lastTxBytes = tx
-                lastPackets = pkts
+                lastRxPackets = rxPackets
+                lastTxPackets = txPackets
 
                 _stats.value = BridgeStats(
                     rxBytes = rx,
                     txBytes = tx,
-                    rxPackets = pkts,
-                    txPackets = pkts,
-                    droppedPackets = 0L,
+                    rxPackets = rxPackets,
+                    txPackets = txPackets,
+                    droppedPackets = dropped,
                     currentRxKBs = rxDelta / 1024.0,
                     currentTxKBs = txDelta / 1024.0,
                     currentPps = pps,
@@ -430,23 +488,16 @@ class PlcBridgeService : Service() {
         }
     }
 
+    // Compatibility name retained for the UI; this is an ARP who-has probe, not gratuitous ARP.
     fun sendGratuitousArp() {
-        serviceScope.launch {
-            val req = arpEngine.buildArpRequest(ArpEngine.parseIp(ethernetConfig.targetPlcIp))
-            if (usbManager.isConnected) {
-                usbManager.sendFrame(req, req.size)
-                logPacket("ARP-PROBE", ethernetConfig.adapterIp, ethernetConfig.targetPlcIp, req.size, "Gratuitous ARP broadcast", "", false)
-            }
-        }
+        sendArpRequestFor(ethernetConfig.targetPlcIp)
     }
 
     fun sendArpRequestFor(targetIp: String) {
         serviceScope.launch {
             val req = arpEngine.buildArpRequest(ArpEngine.parseIp(targetIp))
-            if (usbManager.isConnected) {
-                usbManager.sendFrame(req, req.size)
-                logPacket("ARP-REQ", ethernetConfig.adapterIp, targetIp, req.size, "Who-has $targetIp", "", false)
-            }
+            transmitEthernetFrame(req, "ARP who-has $targetIp")
+            logPacket("ARP-REQ", ethernetConfig.adapterIp, targetIp, req.size, "Who-has $targetIp", "", false)
         }
     }
 
@@ -477,7 +528,13 @@ class PlcBridgeService : Service() {
     fun resetStats() {
         totalRxBytes.set(0L)
         totalTxBytes.set(0L)
-        totalPackets.set(0L)
+        totalRxPackets.set(0L)
+        totalTxPackets.set(0L)
+        totalDroppedPackets.set(0L)
+        lastRxBytes = 0L
+        lastTxBytes = 0L
+        lastRxPackets = 0L
+        lastTxPackets = 0L
         _stats.value = BridgeStats()
     }
 
