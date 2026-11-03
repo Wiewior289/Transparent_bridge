@@ -3,7 +3,6 @@ package com.example.usbecm;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbManager;
-import java.util.concurrent.atomic.AtomicLong;
 
 /** Frame-oriented CDC-ECM transport. Exposes Ethernet frames, not IP semantics. */
 public final class UsbEcmTransport implements AutoCloseable {
@@ -13,14 +12,12 @@ public final class UsbEcmTransport implements AutoCloseable {
     private final CdcEcmBinder binder;
     private final Logger logger;
     private final String macAddress;
-    private final AtomicLong txFrames = new AtomicLong();
-    private final AtomicLong rxFrames = new AtomicLong();
-    private final AtomicLong txBytes = new AtomicLong();
-    private final AtomicLong rxBytes = new AtomicLong();
-    private final AtomicLong txErrors = new AtomicLong();
-    private final AtomicLong rxMalformedFrames = new AtomicLong();
-    private final AtomicLong rxNegativeCompletions = new AtomicLong();
-    private final AtomicLong rxIoExceptions = new AtomicLong();
+    private final UsbEcmRxStats rxStats = new UsbEcmRxStats();
+    private final java.util.concurrent.atomic.AtomicLong txFrames = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong txBytes = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong txErrors = new java.util.concurrent.atomic.AtomicLong();
+    private final Object txLock = new Object();
+    private final Object rxLock = new Object();
     private volatile boolean closed;
 
     private UsbEcmTransport(UsbDeviceConnection connection, CdcEcmProfile profile,
@@ -84,60 +81,59 @@ public final class UsbEcmTransport implements AutoCloseable {
                 device.getDeviceProtocol() == 0x00;
     }
 
+    /**
+     * Serializes complete Ethernet frame submissions to the shared Bulk OUT endpoint.
+     * The production service can submit from more than one coroutine.
+     */
     public int sendFrame(byte[] frame, int length, int timeoutMs) {
-        if (closed || frame == null || length < 14 || length > frame.length) return -1;
-        int maxFrame = profile.maxSegmentSize > 0 ? profile.maxSegmentSize : 1514;
-        if (length > maxFrame) {
-            txErrors.incrementAndGet();
-            logger.log("TX rejected frame length=" + length + " CDC maxSegment=" + maxFrame);
-            return -1;
+        synchronized (txLock) {
+            if (closed || frame == null || length < 14 || length > frame.length) return -1;
+            int maxFrame = profile.maxSegmentSize > 0 ? profile.maxSegmentSize : 1514;
+            if (length > maxFrame) {
+                txErrors.incrementAndGet();
+                logger.log("TX rejected frame length=" + length + " CDC maxSegment=" + maxFrame);
+                return -1;
+            }
+            int result;
+            try {
+                result = connection.bulkTransfer(profile.bulkOut, frame, length, Math.max(1, timeoutMs));
+            } catch (RuntimeException error) {
+                txErrors.incrementAndGet();
+                logger.log("TX bulkTransfer exception: " + error);
+                return -1;
+            }
+            if (result == length) {
+                txFrames.incrementAndGet();
+                txBytes.addAndGet(length);
+            } else {
+                txErrors.incrementAndGet();
+                logger.log("TX incomplete result=" + result + "/" + length);
+            }
+            return result;
         }
-        int result;
-        try {
-            result = connection.bulkTransfer(profile.bulkOut, frame, length, Math.max(1, timeoutMs));
-        } catch (RuntimeException error) {
-            txErrors.incrementAndGet();
-            logger.log("TX bulkTransfer exception: " + error);
-            return -1;
-        }
-        if (result == length) {
-            txFrames.incrementAndGet();
-            txBytes.addAndGet(length);
-        } else {
-            txErrors.incrementAndGet();
-            logger.log("TX incomplete result=" + result + "/" + length);
-        }
-        return result;
     }
 
+    /** Only one consumer may read a CDC-ECM bulk-IN endpoint at a time. */
     public int receiveFrame(byte[] target, int timeoutMs) {
-        if (closed || target == null || target.length < 14) return -1;
-        int requestLength = target.length;
-        int maxPacket = profile.bulkIn.getMaxPacketSize();
-        if (maxPacket > 0 && requestLength >= maxPacket) {
-            requestLength -= requestLength % maxPacket;
-            if (requestLength == 0) requestLength = maxPacket;
-        }
-        int result;
-        try {
-            result = connection.bulkTransfer(profile.bulkIn, target, requestLength, Math.max(1, timeoutMs));
-        } catch (RuntimeException error) {
-            rxIoExceptions.incrementAndGet();
-            logger.log("RX bulkTransfer exception: " + error);
-            return -1;
-        }
-        if (result > 0) {
-            if (result >= 14) {
-                rxFrames.incrementAndGet();
-                rxBytes.addAndGet(result);
-            } else {
-                rxMalformedFrames.incrementAndGet();
+        synchronized (rxLock) {
+            if (closed || target == null || target.length < 14) return -1;
+            int requestLength = target.length;
+            int maxPacket = profile.bulkIn.getMaxPacketSize();
+            if (maxPacket > 0 && requestLength >= maxPacket) {
+                requestLength -= requestLength % maxPacket;
+                if (requestLength == 0) requestLength = maxPacket;
             }
-        } else if (result < 0) {
-            // Android bulkTransfer reports timeout and I/O failures with the same negative result.
-            // Count this as a negative completion, not as a confirmed USB error.
+            int result;
+            try {
+                result = connection.bulkTransfer(profile.bulkIn, target, requestLength, Math.max(1, timeoutMs));
+            } catch (RuntimeException error) {
+                rxStats.recordIoException();
+                logger.log("RX bulkTransfer exception: " + error);
+                return -1;
+            }
+            rxStats.recordCompletion(result);
+            return result;
         }
-        return result;
     }
 
     public boolean isOpen() { return !closed; }
@@ -153,17 +149,23 @@ public final class UsbEcmTransport implements AutoCloseable {
     public int getBulkOutMaxPacketSize() { return profile.bulkOut.getMaxPacketSize(); }
     public int getMaxSegmentSize() { return profile.maxSegmentSize; }
     public long getTxFrames() { return txFrames.get(); }
-    public long getRxFrames() { return rxFrames.get(); }
+    public long getRxFrames() { return rxStats.getFrames(); }
     public long getTxBytes() { return txBytes.get(); }
-    public long getRxBytes() { return rxBytes.get(); }
+    public long getRxBytes() { return rxStats.getBytes(); }
     public long getTxErrors() { return txErrors.get(); }
-    public long getRxMalformedFrames() { return rxMalformedFrames.get(); }
-    public long getRxNegativeCompletions() { return rxNegativeCompletions.get(); }
-    public long getRxIoExceptions() { return rxIoExceptions.get(); }
+    public long getRxMalformedFrames() { return rxStats.getMalformedFrames(); }
+    public long getRxNegativeCompletions() { return rxStats.getNegativeCompletions(); }
+    public long getRxIoExceptions() { return rxStats.getIoExceptions(); }
 
+    /**
+     * Mark closed first, then wait for active endpoint operations before releasing
+     * interfaces and the connection. No new I/O can start after the closed flag flips.
+     */
     @Override public synchronized void close() {
         if (closed) return;
         closed = true;
+        synchronized (txLock) { /* drain any in-flight Bulk OUT transfer */ }
+        synchronized (rxLock) { /* drain any in-flight Bulk IN transfer */ }
         try { binder.close(); } catch (Exception error) { logger.log("CDC binder close failed: " + error); }
         try { connection.close(); } catch (Exception error) { logger.log("USB connection close failed: " + error); }
         logger.log("USB CDC-ECM transport closed");
