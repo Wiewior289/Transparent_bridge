@@ -57,6 +57,9 @@ jobs:
       - name: Build USB probe APK
         run: gradle :usb_probe:assembleDebug --no-configuration-cache
 
+      - name: Run production packet and NAT unit tests
+        run: gradle :app:testDebugUnitTest --no-configuration-cache
+
       - name: Generate CI-only debug keystore
         run: |
           keytool -genkeypair -v -keystore debug.keystore -storepass android \
