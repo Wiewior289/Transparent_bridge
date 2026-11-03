@@ -59,8 +59,6 @@ class PlcBridgeViewModel(application: Application) : AndroidViewModel(applicatio
     private val _selectedFilter = MutableStateFlow("ALL")
     val selectedFilter: StateFlow<String> = _selectedFilter.asStateFlow()
 
-    private val _activeFtpsPorts = MutableStateFlow<List<Int>>(emptyList())
-    val activeFtpsPorts: StateFlow<List<Int>> = _activeFtpsPorts.asStateFlow()
 
     private val _activeProfile = MutableStateFlow(DEFAULT_PROFILES[0])
     val activeProfile: StateFlow<PlcProfile> = _activeProfile.asStateFlow()
@@ -119,7 +117,6 @@ class PlcBridgeViewModel(application: Application) : AndroidViewModel(applicatio
                 refreshUsbDevices()
                 bridgeService?.let { s ->
                     _arpTable.value = s.arpEngine.getArpTable()
-                    _activeFtpsPorts.value = s.ftpsAlg.getActivePorts()
                 }
             }
         }
@@ -204,7 +201,6 @@ class PlcBridgeViewModel(application: Application) : AndroidViewModel(applicatio
         _activeProfile.value = profile
         val updated = _ethernetConfig.value.copy(
             targetPlcIp = profile.targetIp,
-            isFtpsAlgEnabled = profile.isFtpsPasvNeeded
         )
         updateEthernetConfig(updated)
     }
@@ -230,8 +226,7 @@ class PlcBridgeViewModel(application: Application) : AndroidViewModel(applicatio
                 targetIp = "192.168.1.12",
                 vendor = "Schneider / Pro-face",
                 defaultPorts = listOf(21, 8000),
-                description = "FTPS / FTP dynamic PASV data ports & GP-Pro EX Project Download/Receive/Monitor",
-                isFtpsPasvNeeded = true
+                description = "FTPS / FTP dynamic PASV data ports & GP-Pro EX Project Download/Receive/Monitor"
             ),
             PlcProfile(
                 id = "siemens_s7",
@@ -239,8 +234,7 @@ class PlcBridgeViewModel(application: Application) : AndroidViewModel(applicatio
                 targetIp = "192.168.1.200",
                 vendor = "Siemens",
                 defaultPorts = listOf(102),
-                description = "ISO-on-TCP RFC1006 communication for TIA Portal PG/PC diagnostics & program transfer",
-                isFtpsPasvNeeded = false
+                description = "ISO-on-TCP RFC1006 communication for TIA Portal PG/PC diagnostics & program transfer"
             ),
             PlcProfile(
                 id = "modbus_tcp",
