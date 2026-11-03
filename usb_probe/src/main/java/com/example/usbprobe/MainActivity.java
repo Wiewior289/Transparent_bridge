@@ -6,6 +6,7 @@ import android.content.*;
 import android.hardware.usb.*;
 import android.os.Build;
 import android.os.Bundle;
+import android.text.InputType;
 import android.view.View;
 import android.widget.*;
 import java.nio.charset.StandardCharsets;
@@ -36,6 +37,7 @@ public final class MainActivity extends Activity {
     private final ExecutorService controlExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService txExecutor = Executors.newSingleThreadExecutor();
     private final ExecutorService rxExecutor = Executors.newSingleThreadExecutor();
+    private final ScheduledExecutorService probeTimer = Executors.newSingleThreadScheduledExecutor();
     private final AtomicBoolean rxRunning = new AtomicBoolean(false);
     private final AtomicBoolean txWorkerStarted = new AtomicBoolean(false);
     private final ArrayBlockingQueue<byte[]> txQueue = new ArrayBlockingQueue<>(TX_QUEUE_DEPTH);
@@ -44,6 +46,8 @@ public final class MainActivity extends Activity {
 
     private UsbManager manager;
     private TextView output;
+    private EditText localIpInput;
+    private EditText targetIpInput;
     private UsbDevice selected;
     private UsbDeviceConnection connection;
     private UsbInterface controlInterface;
@@ -67,6 +71,19 @@ public final class MainActivity extends Activity {
     private volatile int txErrors;
     private boolean receiverRegistered;
 
+    private static final int PROBE_IDLE = 0;
+    private static final int PROBE_WAIT_ARP = 1;
+    private static final int PROBE_WAIT_ICMP = 2;
+    private volatile int probeState = PROBE_IDLE;
+    private volatile int probeGeneration;
+    private volatile byte[] probeLocalMac;
+    private volatile byte[] probeLocalIp;
+    private volatile byte[] probeTargetIp;
+    private volatile byte[] probePeerMac;
+    private volatile int probeIdentifier;
+    private volatile int probeSequence;
+    private volatile long probeSentNanos;
+
     private final BroadcastReceiver permissionReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
             if (!ACTION_PERMISSION.equals(intent.getAction())) return;
@@ -85,7 +102,26 @@ public final class MainActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         addButton(root, "1. Scan / acquire / replay CDC bind", v -> scan());
         addButton(root, "2. START usbnet-style RX queue", v -> startRx());
-        addButton(root, "3. TX: CDC Ethernet link-test frame", v -> enqueueLinkTestFrame());
+
+        TextView localLabel = new TextView(this);
+        localLabel.setText("Probe source IPv4 (adres wolny na łączu PLC):");
+        root.addView(localLabel);
+        localIpInput = new EditText(this);
+        localIpInput.setSingleLine(true);
+        localIpInput.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        localIpInput.setHint("np. 192.168.1.2");
+        root.addView(localIpInput);
+
+        TextView targetLabel = new TextView(this);
+        targetLabel.setText("PLC target IPv4:");
+        root.addView(targetLabel);
+        targetIpInput = new EditText(this);
+        targetIpInput.setSingleLine(true);
+        targetIpInput.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        targetIpInput.setText("192.168.1.12");
+        root.addView(targetIpInput);
+
+        addButton(root, "3. PING PLC: ARP -> IPv4 ICMP Echo", v -> pingPlc());
         addButton(root, "4. RX: read next queued Ethernet frame", v -> showNextRx());
         addButton(root, "Stop RX/TX queues", v -> stopQueues());
         addButton(root, "Release interfaces / close USB", v -> controlExecutor.execute(this::closeDevice));
@@ -290,47 +326,119 @@ public final class MainActivity extends Activity {
         return Arrays.copyOf(frame, frame.length + 1);
     }
 
-    private void enqueueLinkTestFrame() {
-        if (!configured) { log("TX blocked: CDC bind not complete."); return; }
-        byte[] frame = createArpWhoHasFrame();
-        if (frame == null) return;
-        startTxWorker();
-        if (!txQueue.offer(frame)) { log("TX queue full; frame not submitted."); return; }
-        log("TX queued kernel-style Ethernet ARP who-has frame len=" + frame.length +
-                " sourceMAC=" + macAddress);
-    }
+    private void pingPlc() {
+        if (!configured) { log("PING blocked: CDC bind not complete."); return; }
 
-    /**
-     * A protocol-valid Ethernet/ARP request (not a random EtherType payload):
-     * destination broadcast, source adapter MAC, EtherType ARP, Ethernet/IPv4,
-     * operation request. It uses a stable, documented test target 192.0.2.1.
-     */
-    private byte[] createArpWhoHasFrame() {
-        byte[] source = parseMac(macAddress);
-        if (source == null) {
-            log("TX blocked: CDC iMACAddress string unavailable/invalid; kernel usbnet_cdc_bind() would fail MAC acquisition.");
-            return null;
+        byte[] localMac = EthernetProbe.parseMac(macAddress);
+        byte[] localIp = EthernetProbe.parseIpv4(localIpInput.getText().toString());
+        byte[] targetIp = EthernetProbe.parseIpv4(targetIpInput.getText().toString());
+        if (localMac == null) {
+            log("PING blocked: CDC iMACAddress is absent or invalid.");
+            return;
         }
-        byte[] f = new byte[60];
-        Arrays.fill(f, 0, 6, (byte)0xFF);
-        System.arraycopy(source, 0, f, 6, 6);
-        f[12] = 0x08; f[13] = 0x06; // EtherType ARP
-        f[14] = 0x00; f[15] = 0x01; // Ethernet
-        f[16] = 0x08; f[17] = 0x00; // IPv4
-        f[18] = 0x06; f[19] = 0x04;
-        f[20] = 0x00; f[21] = 0x01; // request
-        System.arraycopy(source, 0, f, 22, 6);
-        // Sender protocol address 0.0.0.0, target protocol address 192.0.2.1.
-        f[28] = 0; f[29] = 0; f[30] = 0; f[31] = 0;
-        f[38] = (byte)192; f[39] = 0; f[40] = 2; f[41] = 1;
-        return f;
+        if (localIp == null || targetIp == null) {
+            log("PING blocked: enter valid unicast IPv4 addresses for source and PLC target.");
+            return;
+        }
+        if (Arrays.equals(localIp, targetIp)) {
+            log("PING blocked: source and target IPv4 addresses must differ.");
+            return;
+        }
+        if (probeState != PROBE_IDLE) {
+            log("PING blocked: another ARP/ICMP probe is still active.");
+            return;
+        }
+
+        probeLocalMac = localMac;
+        probeLocalIp = localIp;
+        probeTargetIp = targetIp;
+        probePeerMac = null;
+        probeIdentifier = (int) ((System.nanoTime() >>> 12) & 0xFFFF);
+        probeSequence = 1;
+        probeState = PROBE_WAIT_ARP;
+        final int generation = ++probeGeneration;
+
+        if (!rxRunning.get()) startRx();
+
+        byte[] arp = EthernetProbe.buildArpRequest(localMac, localIp, targetIp);
+        if (!enqueueFrame(arp, "ARP who-has " + EthernetProbe.formatIpv4(targetIp))) {
+            probeState = PROBE_IDLE;
+            probeGeneration++;
+            return;
+        }
+        log("PING stage=ARP_WAIT source=" + EthernetProbe.formatIpv4(localIp) +
+                " target=" + EthernetProbe.formatIpv4(targetIp) +
+                " sourceMAC=" + macAddress + "; waiting for a matching ARP reply.");
+        probeTimer.schedule(() -> timeoutProbe(generation, PROBE_WAIT_ARP),
+                6, TimeUnit.SECONDS);
     }
 
-    private byte[] parseMac(String value) {
-        if (value == null || !value.matches("(?i)[0-9a-f]{12}")) return null;
-        byte[] out = new byte[6];
-        for (int i = 0; i < 6; i++) out[i] = (byte)Integer.parseInt(value.substring(i * 2, i * 2 + 2), 16);
-        return out;
+    private boolean enqueueFrame(byte[] frame, String description) {
+        if (!configured || frame == null) {
+            log("TX blocked: CDC transport is not ready.");
+            return false;
+        }
+        startTxWorker();
+        if (!txQueue.offer(frame)) {
+            log("TX queue full; not submitted: " + description);
+            return false;
+        }
+        log("TX queued " + description + " len=" + frame.length);
+        return true;
+    }
+
+    private void processProbeFrame(byte[] frame) {
+        int state = probeState;
+        if (state == PROBE_WAIT_ARP) {
+            byte[] peer = EthernetProbe.parseArpReply(
+                    frame, probeLocalMac, probeLocalIp, probeTargetIp);
+            if (peer == null || probeState != PROBE_WAIT_ARP) return;
+
+            probePeerMac = peer;
+            probeState = PROBE_WAIT_ICMP;
+            final int generation = probeGeneration;
+            probeSentNanos = System.nanoTime();
+            log("ARP PASS: " + EthernetProbe.formatIpv4(probeTargetIp) +
+                    " is-at " + mac(peer) + "; constructing IPv4 ICMP Echo Request.");
+
+            byte[] echo = EthernetProbe.buildIcmpEchoRequest(
+                    probeLocalMac, peer, probeLocalIp, probeTargetIp,
+                    probeIdentifier, probeSequence);
+            if (!enqueueFrame(echo, "IPv4/ICMP Echo Request " +
+                    EthernetProbe.formatIpv4(probeLocalIp) + " -> " +
+                    EthernetProbe.formatIpv4(probeTargetIp))) {
+                probeState = PROBE_IDLE;
+                probeGeneration++;
+                return;
+            }
+            probeTimer.schedule(() -> timeoutProbe(generation, PROBE_WAIT_ICMP),
+                    6, TimeUnit.SECONDS);
+            return;
+        }
+
+        if (state == PROBE_WAIT_ICMP && probeState == PROBE_WAIT_ICMP &&
+                EthernetProbe.isIcmpEchoReply(frame, probeLocalMac, probePeerMac,
+                        probeLocalIp, probeTargetIp, probeIdentifier, probeSequence)) {
+            long rttMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - probeSentNanos);
+            probeState = PROBE_IDLE;
+            probeGeneration++;
+            log("PING PASS: ICMP Echo Reply " + EthernetProbe.formatIpv4(probeTargetIp) +
+                    " -> " + EthernetProbe.formatIpv4(probeLocalIp) +
+                    " peerMAC=" + mac(probePeerMac) + " rtt=" + rttMs + " ms" +
+                    "; IPv4 and ICMP checksums valid.");
+        }
+    }
+
+    private void timeoutProbe(int generation, int expectedState) {
+        if (generation != probeGeneration || probeState != expectedState) return;
+        probeState = PROBE_IDLE;
+        if (expectedState == PROBE_WAIT_ARP) {
+            log("PING FAIL: ARP timeout for " + EthernetProbe.formatIpv4(probeTargetIp) +
+                    ". No matching ARP reply reached USB bulk IN.");
+        } else {
+            log("PING FAIL: ARP resolved to " + mac(probePeerMac) +
+                    " but no matching ICMP Echo Reply reached USB bulk IN.");
+        }
     }
 
     private void startRx() {
@@ -362,6 +470,7 @@ public final class MainActivity extends Activity {
                             log("RX discarded undersized transfer len=" + result);
                         } else {
                             byte[] frame = Arrays.copyOf(transfer, result);
+                            processProbeFrame(frame);
                             if (!rxQueue.offer(frame)) {
                                 rxErrors++;
                                 log("RX queue full: drop frame len=" + result);
@@ -413,12 +522,19 @@ public final class MainActivity extends Activity {
         rxRunning.set(false);
         txRunning = false;
         txQueue.clear();
+        if (probeState != PROBE_IDLE) {
+            probeState = PROBE_IDLE;
+            probeGeneration++;
+            log("ARP/ICMP probe cancelled with queue stop.");
+        }
         log("Queue stop requested. TX worker will exit after any active bulk transfer returns.");
     }
 
     private void closeDevice() {
         configured = false;
         rxRunning.set(false);
+        probeState = PROBE_IDLE;
+        probeGeneration++;
         txRunning = false;
         txQueue.clear();
         UsbDeviceConnection c;
@@ -452,6 +568,7 @@ public final class MainActivity extends Activity {
         controlExecutor.shutdown();
         txExecutor.shutdownNow();
         rxExecutor.shutdownNow();
+        probeTimer.shutdownNow();
         if (receiverRegistered) unregisterReceiver(permissionReceiver);
         super.onDestroy();
     }
