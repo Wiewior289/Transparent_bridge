@@ -162,10 +162,6 @@ class PlcBridgeViewModel(application: Application) : AndroidViewModel(applicatio
         bridgeService?.probePlc()
     }
 
-    fun sendGratuitousArp() {
-        bridgeService?.sendGratuitousArp()
-    }
-
     fun resetStats() {
         bridgeService?.resetStats()
     }
