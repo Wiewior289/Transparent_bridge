@@ -7,6 +7,7 @@ import android.hardware.usb.*;
 import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
+import android.text.method.DigitsKeyListener;
 import android.view.View;
 import android.widget.*;
 import java.nio.charset.StandardCharsets;
@@ -109,6 +110,7 @@ public final class MainActivity extends Activity {
         localIpInput = new EditText(this);
         localIpInput.setSingleLine(true);
         localIpInput.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        localIpInput.setKeyListener(DigitsKeyListener.getInstance("0123456789."));
         localIpInput.setHint("np. 192.168.1.2");
         root.addView(localIpInput);
 
@@ -118,6 +120,7 @@ public final class MainActivity extends Activity {
         targetIpInput = new EditText(this);
         targetIpInput.setSingleLine(true);
         targetIpInput.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        targetIpInput.setKeyListener(DigitsKeyListener.getInstance("0123456789."));
         targetIpInput.setText("192.168.1.12");
         root.addView(targetIpInput);
 
