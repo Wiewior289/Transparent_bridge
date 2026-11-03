@@ -67,14 +67,14 @@ Gate: odtwarzalny build probe i apk.
 - UsbEcmTransport udostępnia wyłącznie complete-frame send/receive, MAC, parametry endpointów i liczniki.
 - Produkcyjny UsbEthernetManager używa tego transportu dla CDC-ECM.
 - Legacy Realtek path pozostaje oddzielnym backendem.
-Gate: CI + na telefonie identyczny CDC bind, ARP i ICMP przez probe i produkcyjny manager.
+Status implementacji: wspólny moduł oraz integracja app i probe są w gałęzi. Probe i production manager używają tego samego UsbEcmTransport do RX/TX. Pozostaje powtórzyć test WCH/PLC na urządzeniu z nowym APK.
 
 ### Etap 2 — transport i lifecycle
 - Jeden właściciel połączenia USB.
 - Liczniki RX/TX frames, bytes, błędów, timeoutów (o ile API pozwala je rozdzielić), malformed frames, drop i disconnect.
 - Testy reconnect, permission revoke, close/release.
 - Nie stosować ZLP/pad heurystyki bez pomiaru dla danego adaptera.
-Gate: soak RX/TX i wielokrotne unplug/replug bez wiszących workerów.
+Status implementacji: synchroniczny transport ma jeden właścicielski lifecycle i podstawowe liczniki. Długotrwały soak, permission revoke i unplug/replug pozostają testami laboratoryjnymi. API bulkTransfer nie rozróżnia wiarygodnie timeoutu od błędu I/O.
 
 ### Etap 3 — IPv4 i conntrack bez ALG
 - Walidacja Version, IHL, Total Length, header checksum i granic nagłówków.
@@ -84,14 +84,14 @@ Gate: soak RX/TX i wielokrotne unplug/replug bez wiszących workerów.
 - ICMP identifier mapping oraz checksum update.
 - Timeouty sesji.
 - Usunięcie ALG i powiązanych pól/UI. PASV/EPSV jako zwykły kolejny flow.
-Gate: testy kolizji portów, wielu klientów/PLC, obcego remote IP/port, ICMP, UDP checksum zero/non-zero, malformed i fragmentów.
+Status implementacji: UserlandNatEngine używa forward/reverse tuple, obsługuje TCP/UDP/ICMP Echo, waliduje IPv4 i jawnie odrzuca fragmenty oraz nieobsługiwane protokoły. Dodano testy UDP, ICMP, obcego peer i fragmentów; ich wynik CI musi być potwierdzony. Testy równoległych klientów i pełnego TCP pozostają do rozszerzenia.
 
 ### Etap 4 — MTU/MSS i Ethernet/ARP
 - Zgodność UserlandTun.MTU, EthernetConfig MTU i MSS.
 - MSS dla IPv4/TCP nie większy niż MTU minus nagłówki IP/TCP; MTU 1360 daje punkt wyjścia 1320.
 - Minimalna długość ramki Ethernet dla ARP, walidacja ARP sender MAC/IP.
 - TTL decrement i checksum update na forward path.
-Gate: capture po obu stronach, duże transfery TCP, brak niespodziewanej fragmentacji.
+Status implementacji: domyślny MTU/MSS ustawiono na 1360/1320, MSS clamp weryfikuje IPv4 Total Length, ramki Ethernet są dopełniane do 60 B, ARP używa rzeczywistego MAC CDC i aktualizuje statyczny wpis po zmianie IP, a forwarding zmniejsza TTL i przelicza checksum. Capture i duże transfery pozostają do testu sprzętowego.
 
 ### Etap 5 — asynchroniczny USB backend
 - Zachować API transportu ramek.
@@ -119,10 +119,10 @@ Gate: raport throughput, RTT, loss, CPU, temperatury.
 |---|---|
 | CDC discovery/bind w probe | sprzętowo potwierdzony |
 | ARP + IPv4 ICMP przez probe | sprzętowo potwierdzony |
-| wspólny transport używany przez app | etap 1 w implementacji |
-| produkcyjny packet pipeline | szkic, wymaga walidacji |
-| full-tuple NAT / ICMP reverse | do implementacji |
-| ALG | do usunięcia |
+| wspólny transport używany przez app i probe | zaimplementowany; CI i test WCH/PLC wymagane |
+| produkcyjny packet pipeline | częściowo zintegrowany; wymaga testu end-to-end |
+| full-tuple NAT / ICMP reverse | zaimplementowany; testy jednostkowe dodane, CI do potwierdzenia |
+| FTP/FTPS ALG | usunięty z modelu, usługi, UI i kodu proxy |
 | UsbRequest | późniejszy etap |
 | Tailscale end-to-end z PLC | niepotwierdzone sprzętowo |
 
