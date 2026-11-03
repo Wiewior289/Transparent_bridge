@@ -18,7 +18,8 @@ public final class UsbEcmTransport implements AutoCloseable {
     private final AtomicLong txBytes = new AtomicLong();
     private final AtomicLong rxBytes = new AtomicLong();
     private final AtomicLong txErrors = new AtomicLong();
-    private final AtomicLong rxErrors = new AtomicLong();
+    private final AtomicLong rxMalformedFrames = new AtomicLong();
+    private final AtomicLong rxNegativeCompletions = new AtomicLong();
     private volatile boolean closed;
 
     private UsbEcmTransport(UsbDeviceConnection connection, CdcEcmProfile profile,
@@ -120,7 +121,7 @@ public final class UsbEcmTransport implements AutoCloseable {
         try {
             result = connection.bulkTransfer(profile.bulkIn, target, requestLength, Math.max(1, timeoutMs));
         } catch (RuntimeException error) {
-            rxErrors.incrementAndGet();
+            rxNegativeCompletions.incrementAndGet();
             logger.log("RX bulkTransfer exception: " + error);
             return -1;
         }
@@ -129,10 +130,11 @@ public final class UsbEcmTransport implements AutoCloseable {
                 rxFrames.incrementAndGet();
                 rxBytes.addAndGet(result);
             } else {
-                rxErrors.incrementAndGet();
+                rxMalformedFrames.incrementAndGet();
             }
         } else if (result < 0) {
-            rxErrors.incrementAndGet();
+            // Android bulkTransfer reports timeout and I/O failures with the same negative result.
+            // Count this as a negative completion, not as a confirmed USB error.
         }
         return result;
     }
@@ -154,7 +156,8 @@ public final class UsbEcmTransport implements AutoCloseable {
     public long getTxBytes() { return txBytes.get(); }
     public long getRxBytes() { return rxBytes.get(); }
     public long getTxErrors() { return txErrors.get(); }
-    public long getRxErrors() { return rxErrors.get(); }
+    public long getRxMalformedFrames() { return rxMalformedFrames.get(); }
+    public long getRxNegativeCompletions() { return rxNegativeCompletions.get(); }
 
     @Override public synchronized void close() {
         if (closed) return;
