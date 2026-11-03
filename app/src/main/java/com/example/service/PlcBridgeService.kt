@@ -23,8 +23,6 @@ import com.example.core.model.BridgeStats
 import com.example.core.model.EthernetConfig
 import com.example.core.model.PacketLog
 import com.example.core.net.ArpEngine
-import com.example.core.net.FtpsAlg
-import com.example.core.net.RingBuffer
 import com.example.core.net.UserlandNatEngine
 import com.example.core.usb.UsbEthernetManager
 import com.example.core.vpn.TailscaleBridgeJni
@@ -70,14 +68,11 @@ class PlcBridgeService : Service() {
         private set
     lateinit var arpEngine: ArpEngine
         private set
-    lateinit var ftpsAlg: FtpsAlg
-        private set
     lateinit var natEngine: UserlandNatEngine
         private set
     lateinit var tailscaleManager: TailscaleSubnetManager
         private set
 
-    private val ringBuffer = RingBuffer(capacity = 2048, blockSize = 1600)
 
     private val _bridgeState = MutableStateFlow(BridgeState.STOPPED)
     val bridgeState: StateFlow<BridgeState> = _bridgeState.asStateFlow()
@@ -117,8 +112,7 @@ class PlcBridgeService : Service() {
             virtualMac = ArpEngine.parseMac(ethernetConfig.virtualMac),
             adapterIp = ArpEngine.parseIp(ethernetConfig.adapterIp)
         )
-        ftpsAlg = FtpsAlg()
-        natEngine = UserlandNatEngine(ethernetConfig, ftpsAlg)
+        natEngine = UserlandNatEngine(ethernetConfig)
         tailscaleManager = TailscaleSubnetManager(this)
 
         if (TailscaleBridgeJni.isLibraryLoaded) {
@@ -398,8 +392,6 @@ class PlcBridgeService : Service() {
                     logPacket("IP-DROP", srcIp, dstIp, ipLen, "No NAT session mapping found", "", false)
                 }
 
-                // Also store in zero-copy ring buffer
-                ringBuffer.write(frame, 0, length)
             }
         }
     }
@@ -486,7 +478,6 @@ class PlcBridgeService : Service() {
         totalRxBytes.set(0L)
         totalTxBytes.set(0L)
         totalPackets.set(0L)
-        ringBuffer.clear()
         _stats.value = BridgeStats()
     }
 
