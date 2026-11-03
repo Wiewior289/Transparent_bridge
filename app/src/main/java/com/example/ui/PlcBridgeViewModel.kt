@@ -250,8 +250,7 @@ class PlcBridgeViewModel(application: Application) : AndroidViewModel(applicatio
                 targetIp = "192.168.1.10",
                 vendor = "Omron",
                 defaultPorts = listOf(9600, 44818),
-                description = "FINS Protocol UDP/TCP 9600 and EtherNet/IP CIP 44818 for Sysmac Studio / CX-Programmer",
-                isFtpsPasvNeeded = false
+                description = "FINS Protocol UDP/TCP 9600 and EtherNet/IP CIP 44818 for Sysmac Studio / CX-Programmer"
             ),
             PlcProfile(
                 id = "mitsubishi_melsec",
