@@ -88,7 +88,7 @@ class PlcBridgeService : Service() {
             field = value
             if (::natEngine.isInitialized) natEngine.config = value
             if (::arpEngine.isInitialized) {
-                arpEngine.adapterIp = ArpEngine.parseIp(value.adapterIp)
+                arpEngine.setAdapterIp(ArpEngine.parseIp(value.adapterIp))
             }
         }
 
