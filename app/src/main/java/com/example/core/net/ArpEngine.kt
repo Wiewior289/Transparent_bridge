@@ -40,11 +40,11 @@ class ArpEngine(
         }
     }
 
-    fun queuePendingPacket(targetIp: String, ipPacket: ByteArray) {
+    fun queuePendingPacket(targetIp: String, ipPacket: ByteArray): Boolean {
         val queue = pendingPackets.computeIfAbsent(targetIp) { ConcurrentLinkedQueue() }
-        if (queue.size < 64) { // Bound queue to prevent memory leak
-            queue.add(ipPacket.copyOf())
-        }
+        if (queue.size >= 64) return false
+        queue.add(ipPacket.copyOf())
+        return true
     }
 
     fun getAndClearPendingPackets(targetIp: String): List<ByteArray> {
@@ -111,7 +111,10 @@ class ArpEngine(
         val localIp = formatIp(adapterIp)
 
         // Do not learn 0.0.0.0 (ARP probes), multicast or malformed sender IPs.
-        if (isUsableUnicastIp(senderIp)) {
+        // An ARP reply is learned only when it is addressed to this adapter.
+        val addressedToUs = targetIp == localIp && targetMac.contentEquals(virtualMac)
+        val mayLearn = isUsableUnicastIp(senderIp) && (op == 1 || addressedToUs)
+        if (mayLearn) {
             val existing = arpTable[senderIp]
             if (existing == null || !existing.isStatic) {
                 arpTable[senderIp] = ArpEntry(
