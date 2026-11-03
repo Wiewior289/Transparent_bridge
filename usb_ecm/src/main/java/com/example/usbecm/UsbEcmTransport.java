@@ -20,6 +20,7 @@ public final class UsbEcmTransport implements AutoCloseable {
     private final AtomicLong txErrors = new AtomicLong();
     private final AtomicLong rxMalformedFrames = new AtomicLong();
     private final AtomicLong rxNegativeCompletions = new AtomicLong();
+    private final AtomicLong rxIoExceptions = new AtomicLong();
     private volatile boolean closed;
 
     private UsbEcmTransport(UsbDeviceConnection connection, CdcEcmProfile profile,
@@ -121,7 +122,7 @@ public final class UsbEcmTransport implements AutoCloseable {
         try {
             result = connection.bulkTransfer(profile.bulkIn, target, requestLength, Math.max(1, timeoutMs));
         } catch (RuntimeException error) {
-            rxNegativeCompletions.incrementAndGet();
+            rxIoExceptions.incrementAndGet();
             logger.log("RX bulkTransfer exception: " + error);
             return -1;
         }
@@ -158,6 +159,7 @@ public final class UsbEcmTransport implements AutoCloseable {
     public long getTxErrors() { return txErrors.get(); }
     public long getRxMalformedFrames() { return rxMalformedFrames.get(); }
     public long getRxNegativeCompletions() { return rxNegativeCompletions.get(); }
+    public long getRxIoExceptions() { return rxIoExceptions.get(); }
 
     @Override public synchronized void close() {
         if (closed) return;
