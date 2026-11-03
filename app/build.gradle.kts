@@ -94,6 +94,7 @@ googleServices {
 }
 
 dependencies {
+    implementation(project(":usb_ecm"))
     implementation(platform(libs.androidx.compose.bom))
     implementation(platform(libs.firebase.bom))
 
