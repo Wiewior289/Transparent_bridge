@@ -192,7 +192,7 @@ fun DashboardScreen(
 
         // Live Telemetry Speedometers & Counters
         Text(
-            text = "LIVE TELEMETRY (RING BUFFER ZERO-COPY)",
+            text = "LIVE TELEMETRY (USB / IP PIPELINE)",
             fontSize = 12.sp,
             fontWeight = FontWeight.Bold,
             color = TextSecondary,
