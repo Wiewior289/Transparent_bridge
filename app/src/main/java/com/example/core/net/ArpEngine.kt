@@ -61,10 +61,14 @@ class ArpEngine(
      * Wraps raw IPv4 packet in a 14-byte Ethernet frame.
      */
     fun wrapInEthernetHeader(ipPacket: ByteArray, ipOffset: Int, ipLen: Int, dstMac: ByteArray): ByteArray {
-        val frame = ByteArray(14 + ipLen)
+        require(ipOffset >= 0 && ipLen >= 20 && ipOffset <= ipPacket.size - ipLen) {
+            "Invalid IPv4 packet range"
+        }
+        require(dstMac.size == 6 && virtualMac.size == 6) { "Ethernet MAC must be 6 bytes" }
+        val frame = ByteArray(maxOf(60, 14 + ipLen))
         System.arraycopy(dstMac, 0, frame, 0, 6)
         System.arraycopy(virtualMac, 0, frame, 6, 6)
-        frame[12] = 0x08.toByte() // EtherType IPv4 (0x0800)
+        frame[12] = 0x08.toByte()
         frame[13] = 0x00.toByte()
         System.arraycopy(ipPacket, ipOffset, frame, 14, ipLen)
         return frame
@@ -92,31 +96,41 @@ class ArpEngine(
             return null
         }
         
+        if (op != 1 && op != 2) return null
+
         val senderMac = ByteArray(6)
         System.arraycopy(frame, 22, senderMac, 0, 6)
+        val ethernetSourceMac = ByteArray(6)
+        System.arraycopy(frame, 6, ethernetSourceMac, 0, 6)
+        if (!senderMac.contentEquals(ethernetSourceMac) || !isUsableUnicastMac(senderMac)) return null
+
         val senderIp = formatIp(frame, 28)
-        
         val targetMac = ByteArray(6)
         System.arraycopy(frame, 32, targetMac, 0, 6)
         val targetIp = formatIp(frame, 38)
-        
-        // Cache sender's MAC in our ARP table
-        val existing = arpTable[senderIp]
-        if (existing == null || !existing.isStatic) {
-            arpTable[senderIp] = ArpEntry(
-                ip = senderIp,
-                mac = formatMac(senderMac),
-                isStatic = false,
-                lastSeenMs = System.currentTimeMillis(),
-                isResolved = true
-            )
+        val localIp = formatIp(adapterIp)
+
+        // Do not learn 0.0.0.0 (ARP probes), multicast or malformed sender IPs.
+        if (isUsableUnicastIp(senderIp)) {
+            val existing = arpTable[senderIp]
+            if (existing == null || !existing.isStatic) {
+                arpTable[senderIp] = ArpEntry(
+                    ip = senderIp,
+                    mac = formatMac(senderMac),
+                    isStatic = false,
+                    lastSeenMs = System.currentTimeMillis(),
+                    isResolved = true
+                )
+            }
         }
-        
-        // If someone is asking "Who has 192.168.1.100?" (our adapter IP)
-        if (op == 1 && targetIp == formatIp(adapterIp)) {
+
+        // ARP requests may use zero target hardware or our own MAC.
+        val targetHardwareIsUs = targetMac.contentEquals(ByteArray(6)) ||
+            targetMac.contentEquals(virtualMac)
+        if (op == 1 && targetIp == localIp && targetHardwareIsUs) {
             return buildArpReply(senderMac, parseIp(senderIp))
         }
-        
+
         return null
     }
 
@@ -125,7 +139,7 @@ class ArpEngine(
      * "192.168.1.100 is at 02:00:00:00:00:01"
      */
     fun buildArpReply(targetMac: ByteArray, targetIp: ByteArray): ByteArray {
-        val reply = ByteArray(42) // 14 Ethernet + 28 ARP
+        val reply = ByteArray(60) // Minimum Ethernet frame without FCS
         
         // Ethernet Header
         System.arraycopy(targetMac, 0, reply, 0, 6)    // Dst MAC
@@ -156,7 +170,7 @@ class ArpEngine(
      * "Who has targetIp? Tell adapterIp"
      */
     fun buildArpRequest(targetIp: ByteArray): ByteArray {
-        val request = ByteArray(42)
+        val request = ByteArray(60)
         val broadcastMac = byteArrayOf(
             0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(),
             0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte()
@@ -185,6 +199,21 @@ class ArpEngine(
         System.arraycopy(targetIp, 0, request, 38, 4)
         
         return request
+    }
+
+    private fun isUsableUnicastMac(mac: ByteArray): Boolean {
+        if (mac.size != 6 || (mac[0].toInt() and 1) != 0) return false
+        return mac.any { it.toInt() != 0 }
+    }
+
+    private fun isUsableUnicastIp(value: String): Boolean {
+        val parts = value.split(".")
+        if (parts.size != 4) return false
+        val octets = parts.map { it.toIntOrNull() ?: return false }
+        if (octets.any { it !in 0..255 }) return false
+        val first = octets[0]
+        return octets.any { it != 0 } && first != 0 && first != 127 && first < 224 &&
+            !(octets[0] == 255 && octets[1] == 255 && octets[2] == 255 && octets[3] == 255)
     }
 
     companion object {
