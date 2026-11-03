@@ -37,6 +37,23 @@ class UserlandNatEngineTest {
     }
 
     @Test
+    fun udpNonZeroChecksumSurvivesBothNatDirections() {
+        val engine = UserlandNatEngine(EthernetConfig(adapterIp = "192.168.1.100", mtu = 1360, targetMss = 1320))
+        val outgoing = buildUdp(clientIp, plcIp, 43123, 502, checksumEnabled = true)
+
+        assertTrue(engine.processOutgoingPacket(outgoing, 0, outgoing.size))
+        assertIp(adapterIp, outgoing, 12)
+        assertEquals(0xFFFF, udpChecksumValidation(outgoing))
+
+        val translatedPort = u16(outgoing, 20)
+        val reply = buildUdp(plcIp, adapterIp, 502, translatedPort, checksumEnabled = true)
+        assertTrue(engine.processIncomingPacket(reply, 0, reply.size))
+        assertIp(clientIp, reply, 16)
+        assertEquals(43123, u16(reply, 22))
+        assertEquals(0xFFFF, udpChecksumValidation(reply))
+    }
+
+    @Test
     fun icmpEchoIdentifierIsTranslatedAndRestored() {
         val engine = UserlandNatEngine(EthernetConfig(adapterIp = "192.168.1.100", mtu = 1360, targetMss = 1320))
         val request = buildIcmp(clientIp, plcIp, type = 8, identifier = 0x1234)
@@ -135,6 +152,27 @@ class UserlandNatEngineTest {
         while ((sum ushr 16) != 0L) sum = (sum and 0xFFFF) + (sum ushr 16)
         val result = sum.inv().toInt() and 0xFFFF
         return if (result == 0) 0xFFFF else result
+    }
+
+    /** Returns the folded pseudo-header + UDP checksum sum; valid packets equal 0xFFFF. */
+    private fun udpChecksumValidation(packet: ByteArray): Int {
+        var sum = 0L
+        sum += u16(packet, 12).toLong()
+        sum += u16(packet, 14).toLong()
+        sum += u16(packet, 16).toLong()
+        sum += u16(packet, 18).toLong()
+        sum += 17L
+        val udpLength = u16(packet, 24)
+        sum += udpLength.toLong()
+        var p = 20
+        val end = 20 + udpLength
+        while (p + 1 < end) {
+            sum += u16(packet, p).toLong()
+            p += 2
+        }
+        if (p < end) sum += ((packet[p].toInt() and 0xFF) shl 8).toLong()
+        while ((sum ushr 16) != 0L) sum = (sum and 0xFFFF) + (sum ushr 16)
+        return sum.toInt() and 0xFFFF
     }
 
     private fun refreshIpChecksum(packet: ByteArray) {
