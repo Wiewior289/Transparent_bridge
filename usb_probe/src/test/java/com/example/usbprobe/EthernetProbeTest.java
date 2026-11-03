@@ -17,6 +17,9 @@ public class EthernetProbeTest {
         assertNull(EthernetProbe.parseIpv4("192.168.1"));
         assertNull(EthernetProbe.parseIpv4("0.0.0.0"));
         assertNull(EthernetProbe.parseIpv4("255.255.255.255"));
+        assertNull(EthernetProbe.parseIpv4("127.0.0.1"));
+        assertNull(EthernetProbe.parseIpv4("224.1.2.3"));
+        assertNull(EthernetProbe.parseIpv4("240.0.0.1"));
         assertArrayEquals(LOCAL_MAC, EthernetProbe.parseMac("021122334455"));
         assertNull(EthernetProbe.parseMac("FF:FF:FF:FF:FF:FF"));
         assertNull(EthernetProbe.parseMac("00:00:00:00:00:00"));
