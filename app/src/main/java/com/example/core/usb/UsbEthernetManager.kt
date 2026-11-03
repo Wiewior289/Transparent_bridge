@@ -12,6 +12,7 @@ import android.hardware.usb.UsbManager
 import android.os.Build
 import android.util.Log
 import com.example.core.model.UsbDeviceInfo
+import com.example.usbecm.UsbEcmTransport
 
 class UsbEthernetManager(private val context: Context) {
 
@@ -27,12 +28,13 @@ class UsbEthernetManager(private val context: Context) {
     private val claimedInterfaces = mutableListOf<UsbInterface>()
     private var inEndpoint: UsbEndpoint? = null
     private var outEndpoint: UsbEndpoint? = null
+    private var cdcTransport: UsbEcmTransport? = null
     
     var realtekDriver: RealtekDriver? = null
         private set
 
     val isConnected: Boolean
-        get() = activeConnection != null && inEndpoint != null && outEndpoint != null && claimedInterfaces.isNotEmpty()
+        get() = cdcTransport?.isOpen() == true || (activeConnection != null && inEndpoint != null && outEndpoint != null && claimedInterfaces.isNotEmpty())
 
     val fileDescriptor: Int?
         get() = try {
@@ -51,7 +53,7 @@ class UsbEthernetManager(private val context: Context) {
         for ((_, device) in deviceList) {
             val chipset = identifyChipset(device.vendorId, device.productId, device)
             val hasPerm = usbManager.hasPermission(device)
-            val isOpen = activeDevice == device && activeConnection != null
+            val isOpen = activeDevice == device && (activeConnection != null || cdcTransport?.isOpen() == true)
 
             results.add(
                 UsbDeviceInfo(
@@ -63,7 +65,7 @@ class UsbEthernetManager(private val context: Context) {
                     chipset = chipset,
                     isPermissionGranted = hasPerm,
                     hasActiveFd = isOpen,
-                    fileDescriptor = if (isOpen) activeConnection?.fileDescriptor else null
+                    fileDescriptor = if (isOpen) cdcTransport?.getFileDescriptor() ?: activeConnection?.fileDescriptor else null
                 )
             )
         }
@@ -92,11 +94,10 @@ class UsbEthernetManager(private val context: Context) {
     @Synchronized
     fun connectToDevice(device: UsbDevice): Boolean {
         // Nie otwieraj drugi raz tego samego urządzenia.
-        if (activeConnection != null &&
-            activeDevice?.deviceName == device.deviceName &&
-            claimedInterfaces.isNotEmpty() &&
-            inEndpoint != null &&
-            outEndpoint != null
+        if (activeDevice?.deviceName == device.deviceName &&
+            (cdcTransport?.isOpen() == true ||
+                (activeConnection != null && claimedInterfaces.isNotEmpty() &&
+                    inEndpoint != null && outEndpoint != null))
         ) {
             Log.d(TAG, "Ignoring duplicate USB connect: ${device.deviceName}")
             return true
@@ -107,6 +108,26 @@ class UsbEthernetManager(private val context: Context) {
         if (!usbManager.hasPermission(device)) {
             Log.e(TAG, "No USB permission for device: ${device.deviceName}")
             return false
+        }
+
+        // The WCH/CDC-ECM path is descriptor-driven and shared with usb_probe.
+        // If this control-interface signature exists but its CDC function fails,
+        // do not bypass the failure by grabbing arbitrary bulk endpoints.
+        if (UsbEcmTransport.hasControlInterfaceSignature(device)) {
+            return try {
+                cdcTransport = UsbEcmTransport.open(usbManager, device) { message ->
+                    Log.i(TAG, message)
+                }
+                activeDevice = device
+                Log.i(TAG, "CDC-ECM shared frame transport ready: ${device.deviceName}")
+                true
+            } catch (error: Exception) {
+                Log.e(TAG, "Strict CDC-ECM bind failed for ${device.deviceName}", error)
+                cdcTransport?.close()
+                cdcTransport = null
+                activeDevice = null
+                false
+            }
         }
 
         val conn = usbManager.openDevice(device) ?: run {
@@ -214,6 +235,7 @@ class UsbEthernetManager(private val context: Context) {
      * Encapsulates with Realtek 8-byte tx_desc header if Realtek controller.
      */
     fun sendFrame(frame: ByteArray, length: Int): Int {
+        cdcTransport?.let { return it.sendFrame(frame, length, 1000) }
         val conn = activeConnection ?: return -1
         val ep = outEndpoint ?: return -1
 
@@ -240,6 +262,7 @@ class UsbEthernetManager(private val context: Context) {
      * Automatically strips Realtek rx_desc header if present.
      */
     fun receiveFrame(targetBuffer: ByteArray, timeoutMs: Int = 20): Int {
+        cdcTransport?.let { return it.receiveFrame(targetBuffer, timeoutMs) }
         val conn = activeConnection ?: return -1
         val ep = inEndpoint ?: return -1
 
@@ -279,6 +302,8 @@ class UsbEthernetManager(private val context: Context) {
 
     @Synchronized
     fun disconnect() {
+        cdcTransport?.close()
+        cdcTransport = null
         val conn = activeConnection
 
         try {
