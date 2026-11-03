@@ -71,7 +71,6 @@ fun RoutingScreen(viewModel: PlcBridgeViewModel) {
     var targetIpInput by remember(ethConfig.targetPlcIp) { mutableStateOf(ethConfig.targetPlcIp) }
     var mssValue by remember(ethConfig.targetMss) { mutableFloatStateOf(ethConfig.targetMss.toFloat()) }
     var isMssEnabled by remember(ethConfig.isMssClampingEnabled) { mutableStateOf(ethConfig.isMssClampingEnabled) }
-    var isFtpsEnabled by remember(ethConfig.isFtpsAlgEnabled) { mutableStateOf(ethConfig.isFtpsAlgEnabled) }
 
     Column(
         modifier = Modifier
@@ -91,7 +90,7 @@ fun RoutingScreen(viewModel: PlcBridgeViewModel) {
                 letterSpacing = 1.sp
             )
             Text(
-                text = "TCP MSS Clamping & ALG",
+                text = "TCP MSS Clamping",
                 fontSize = 18.sp,
                 fontWeight = FontWeight.ExtraBold,
                 color = TextPrimary
@@ -215,7 +214,7 @@ fun RoutingScreen(viewModel: PlcBridgeViewModel) {
                     onValueChangeFinished = {
                         viewModel.updateEthernetConfig(ethConfig.copy(targetMss = mssValue.toInt()))
                     },
-                    valueRange = 1200f..1460f,
+                    valueRange = 536f..(ethConfig.mtu - 40).coerceAtLeast(536).toFloat(),
                     colors = SliderDefaults.colors(
                         thumbColor = IndustrialAmber,
                         activeTrackColor = IndustrialAmber
@@ -226,7 +225,7 @@ fun RoutingScreen(viewModel: PlcBridgeViewModel) {
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    listOf(1360, 1400, 1460).forEach { preset ->
+                    listOf(1200, 1280, 1320).filter { it <= (ethConfig.mtu - 40) }.forEach { preset ->
                         FilterChip(
                             selected = mssValue.toInt() == preset,
                             onClick = {
@@ -241,58 +240,6 @@ fun RoutingScreen(viewModel: PlcBridgeViewModel) {
                         )
                     }
                 }
-            }
-        }
-
-        // FTPS Dynamic Passive Port ALG Card
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = SurfaceDark),
-            border = androidx.compose.foundation.BorderStroke(1.dp, OutlineDark),
-            shape = RoundedCornerShape(16.dp)
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column {
-                        Text(
-                            text = "FTPS / FTP DYNAMIC PASV ALG",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = IndustrialEmerald,
-                            letterSpacing = 1.sp
-                        )
-                        Text(
-                            text = "Auto-track dynamic ports in 227 replies",
-                            fontSize = 12.sp,
-                            color = TextSecondary
-                        )
-                    }
-
-                    Switch(
-                        checked = isFtpsEnabled,
-                        onCheckedChange = {
-                            isFtpsEnabled = it
-                            viewModel.updateEthernetConfig(ethConfig.copy(isFtpsAlgEnabled = it))
-                        },
-                        colors = SwitchDefaults.colors(
-                            checkedThumbColor = IndustrialEmerald,
-                            checkedTrackColor = IndustrialEmerald.copy(alpha = 0.3f)
-                        )
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                Text(
-                    text = "GP-Pro EX uses PASV data connections. The ALG inspects the 227 responses on port 21 / 8000 and automatically creates userland listeners so download to HMI, receive to PC, and monitor run smoothly.",
-                    fontSize = 12.sp,
-                    color = TextSecondary,
-                    lineHeight = 18.sp
-                )
             }
         }
 
