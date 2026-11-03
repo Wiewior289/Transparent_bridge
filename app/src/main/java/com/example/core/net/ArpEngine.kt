@@ -27,6 +27,17 @@ class ArpEngine(
 
     fun getArpTable(): List<ArpEntry> = arpTable.values.toList()
 
+    /** Updates the local IPv4 address and the static neighbour entry together. */
+    @Synchronized
+    fun setAdapterIp(ip: ByteArray) {
+        require(ip.size == 4) { "Adapter IPv4 address must be 4 bytes" }
+        val oldIp = formatIp(adapterIp)
+        arpTable[oldIp]?.takeIf { it.isStatic }?.let { arpTable.remove(oldIp, it) }
+        adapterIp = ip.copyOf()
+        val newIp = formatIp(adapterIp)
+        arpTable[newIp] = ArpEntry(newIp, formatMac(virtualMac), isStatic = true, isResolved = true)
+    }
+
     /**
      * Replaces the provisional MAC with the adapter's actual CDC-ECM iMACAddress.
      * virtualMac is a retained mutable byte array so frame builders see the same value.
