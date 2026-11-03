@@ -309,12 +309,12 @@ fun DashboardScreen(
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     OutlinedButton(
-                        onClick = { viewModel.sendGratuitousArp() },
+                        onClick = { viewModel.probePlc() },
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(10.dp),
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = IndustrialCyan)
                     ) {
-                        Text("Send ARP", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        Text("ARP Probe", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                     }
 
                     OutlinedButton(
