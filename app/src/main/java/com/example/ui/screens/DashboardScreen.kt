@@ -368,7 +368,7 @@ fun NetworkTopologyCard(
 
             // Link 1: Tailscale Subnet
             LinkConnector(
-                label = "TLS 1.3 / VPN",
+                label = "Tailscale / WireGuard",
                 isActive = isRunning,
                 color = IndustrialCyan
             )
