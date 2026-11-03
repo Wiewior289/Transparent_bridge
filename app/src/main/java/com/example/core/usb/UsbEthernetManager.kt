@@ -36,6 +36,10 @@ class UsbEthernetManager(private val context: Context) {
     val isConnected: Boolean
         get() = cdcTransport?.isOpen() == true || (activeConnection != null && inEndpoint != null && outEndpoint != null && claimedInterfaces.isNotEmpty())
 
+    /** Actual CDC-ECM hardware MAC; null for legacy backends without MAC discovery. */
+    val adapterMacAddress: String?
+        get() = cdcTransport?.getMacAddress()
+
     val fileDescriptor: Int?
         get() = try {
             cdcTransport?.getFileDescriptor() ?: activeConnection?.fileDescriptor
