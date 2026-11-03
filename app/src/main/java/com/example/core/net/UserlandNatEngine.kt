@@ -1,366 +1,475 @@
 package com.example.core.net
 
-import android.util.Log
 import com.example.core.model.EthernetConfig
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Userland NAT (Masquerade / SNAT & DNAT) and Connection Tracker (Conntrack in RAM).
- * 
- * Replaces the Linux root command:
- *   iptables -t nat -I POSTROUTING 1 -o eth0 -j MASQUERADE
- * 
- * Without this masquerade, the HMI (192.168.1.12 / 255.255.255.0) drops packets from 
- * Windows Host (100.64.X.X) because it has no route or gateway to the 100.64.0.0/10 subnet.
- * 
- * This engine rewrites:
- *   Outgoing:  SrcIP 100.64.X.X:srcPort  ➔  SrcIP 192.168.1.100:masqPort
- *   Incoming:  DstIP 192.168.1.100:masqPort ➔ DstIP 100.64.X.X:srcPort
- * 
- * And incrementally recalculates IPv4 Header Checksum & TCP/UDP Checksum (RFC 1624).
+ * IPv4 user-space SNAT/DNAT with exact forward and reverse flow keys.
+ *
+ * Supported transports: TCP, UDP and ICMP Echo only.
+ * IPv4 fragments and unsupported protocols are rejected explicitly.
+ * FTP/FTPS payload inspection is intentionally absent: PASV data sockets are
+ * ordinary independent TCP flows and receive normal conntrack entries.
  */
 class UserlandNatEngine(
-    var config: EthernetConfig = EthernetConfig(),
-    private val ftpsAlg: FtpsAlg = FtpsAlg()
+    var config: EthernetConfig = EthernetConfig()
 ) {
     companion object {
-        private const val TAG = "UserlandNatEngine"
-        private const val SESSION_TIMEOUT_MS = 180_000L // 3 minutes idle timeout
+        private const val SESSION_TIMEOUT_MS = 180_000L
+        private const val FIRST_DYNAMIC_PORT = 45_000
+        private const val LAST_DYNAMIC_PORT = 65_000
+        private const val PROTO_ICMP = 1
+        private const val PROTO_TCP = 6
+        private const val PROTO_UDP = 17
+        private const val ICMP_ECHO_REPLY = 0
+        private const val ICMP_ECHO_REQUEST = 8
     }
 
     data class NatSession(
-        val protocol: Int,          // 6 = TCP, 17 = UDP, 1 = ICMP
-        val origSrcIp: ByteArray,   // e.g. 100.64.15.22
-        val origSrcPort: Int,       // e.g. 54321
-        val targetDstIp: ByteArray, // e.g. 192.168.1.12
-        val targetDstPort: Int,     // e.g. 21
-        val masqPort: Int,          // Port on 192.168.1.100
-        var lastSeenMs: Long = System.currentTimeMillis()
+        val protocol: Int,
+        val origSrcIp: ByteArray,
+        val origSrcPort: Int,
+        val targetDstIp: ByteArray,
+        val targetDstPort: Int,
+        val masqPort: Int,
+        @Volatile var lastSeenMs: Long = System.currentTimeMillis()
     )
 
-    // Lookup: Key (Protocol, MasqPort) ➔ NatSession
-    private val natByMasqPort = ConcurrentHashMap<Int, NatSession>()
-    
-    // Lookup: Key (Protocol, OrigSrcIpStr, OrigSrcPort, DstPort) ➔ MasqPort
-    private val natByClient = ConcurrentHashMap<String, Int>()
+    private data class ForwardKey(
+        val protocol: Int,
+        val sourceIp: Long,
+        val sourcePortOrId: Int,
+        val destinationIp: Long,
+        val destinationPort: Int
+    )
 
-    private val portCounter = AtomicInteger(45000)
+    private data class ReverseKey(
+        val protocol: Int,
+        val remoteIp: Long,
+        val remotePort: Int,
+        val localIp: Long,
+        val translatedPortOrId: Int
+    )
+
+    private data class Ipv4View(
+        val offset: Int,
+        val headerLength: Int,
+        val totalLength: Int,
+        val protocol: Int,
+        val sourceIp: Long,
+        val destinationIp: Long,
+        val transportOffset: Int,
+        val transportLength: Int
+    )
+
+    private val forward = ConcurrentHashMap<ForwardKey, NatSession>()
+    private val reverse = ConcurrentHashMap<ReverseKey, NatSession>()
+    private val allocationLock = Any()
+    private val nextPort = AtomicInteger(FIRST_DYNAMIC_PORT - 1)
 
     val activeSessionCount: Int
-        get() = natByMasqPort.size
+        get() {
+            cleanExpiredSessions()
+            return forward.size
+        }
 
     fun getActiveSessions(): List<NatSession> {
         cleanExpiredSessions()
-        return natByMasqPort.values.toList()
+        return forward.values.toList()
+    }
+
+    /**
+     * Tailscale/UserlandTun -> PLC. Mutates the packet in place.
+     * Returns false for malformed, fragmented, unsupported or unmapped traffic.
+     */
+    fun processOutgoingPacket(packet: ByteArray, offset: Int, length: Int): Boolean {
+        val ip = parseIpv4(packet, offset, length) ?: return false
+        if (ip.protocol != PROTO_TCP && ip.protocol != PROTO_UDP && ip.protocol != PROTO_ICMP) return false
+        if (!validTransport(packet, ip, outbound = true)) return false
+        if (ip.ttl(packet) <= 1) return false
+
+        val adapterIpBytes = parseIpv4Address(config.adapterIp) ?: return false
+        val adapterIp = ipToLong(adapterIpBytes, 0)
+        if (ip.sourceIp == adapterIp) return false
+
+        when (ip.protocol) {
+            PROTO_TCP, PROTO_UDP -> {
+                val sourcePort = readU16(packet, ip.transportOffset)
+                val destinationPort = readU16(packet, ip.transportOffset + 2)
+                val key = ForwardKey(ip.protocol, ip.sourceIp, sourcePort, ip.destinationIp, destinationPort)
+                val session = findOrCreateSession(
+                    key, ip.protocol, ip.sourceIp, sourcePort,
+                    ip.destinationIp, destinationPort, adapterIp, sourcePort
+                ) ?: return false
+
+                if (ip.protocol == PROTO_TCP && config.isMssClampingEnabled) {
+                    val effectiveMss = minOf(config.targetMss, config.mtu - 40).coerceAtLeast(536)
+                    MssClamper.clampMssInPlace(packet, offset, ip.totalLength, effectiveMss)
+                }
+
+                if (!rewriteTransportAddressAndPort(
+                        packet, ip, oldSourceIp = ip.sourceIp, newSourceIp = adapterIp,
+                        oldDestinationIp = ip.destinationIp, newDestinationIp = ip.destinationIp,
+                        portOffset = ip.transportOffset, portOld = sourcePort, portNew = session.masqPort,
+                        rewriteSourcePort = true
+                    )) return false
+
+                if (!decrementTtlAndRefreshIpChecksum(packet, ip)) return false
+                session.lastSeenMs = System.currentTimeMillis()
+                return true
+            }
+
+            PROTO_ICMP -> {
+                val identifier = readU16(packet, ip.transportOffset + 4)
+                val key = ForwardKey(PROTO_ICMP, ip.sourceIp, identifier, ip.destinationIp, 0)
+                val session = findOrCreateSession(
+                    key, PROTO_ICMP, ip.sourceIp, identifier,
+                    ip.destinationIp, 0, adapterIp, identifier
+                ) ?: return false
+
+                rewriteIpv4AddressAndTransportChecksum(
+                    packet, ip, source = true, oldIp = ip.sourceIp, newIp = adapterIp,
+                    transportWordOffset = ip.transportOffset + 4,
+                    oldTransportWord = identifier, newTransportWord = session.masqPort
+                )
+                if (!decrementTtlAndRefreshIpChecksum(packet, ip)) return false
+                session.lastSeenMs = System.currentTimeMillis()
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * PLC -> Tailscale/UserlandTun. Accepts only a reply matching the remote
+     * endpoint and translated local endpoint from an existing flow.
+     */
+    fun processIncomingPacket(packet: ByteArray, offset: Int, length: Int): Boolean {
+        val ip = parseIpv4(packet, offset, length) ?: return false
+        if (ip.protocol != PROTO_TCP && ip.protocol != PROTO_UDP && ip.protocol != PROTO_ICMP) return false
+        if (!validTransport(packet, ip, outbound = false)) return false
+        if (ip.ttl(packet) <= 1) return false
+
+        val adapterIpBytes = parseIpv4Address(config.adapterIp) ?: return false
+        val adapterIp = ipToLong(adapterIpBytes, 0)
+        if (ip.destinationIp != adapterIp) return false
+
+        when (ip.protocol) {
+            PROTO_TCP, PROTO_UDP -> {
+                val sourcePort = readU16(packet, ip.transportOffset)
+                val translatedDestinationPort = readU16(packet, ip.transportOffset + 2)
+                val key = ReverseKey(
+                    ip.protocol, ip.sourceIp, sourcePort, adapterIp, translatedDestinationPort
+                )
+                val session = reverse[key] ?: return false
+
+                if (!rewriteTransportAddressAndPort(
+                        packet, ip, oldSourceIp = ip.sourceIp, newSourceIp = ip.sourceIp,
+                        oldDestinationIp = adapterIp, newDestinationIp = ipToLong(session.origSrcIp, 0),
+                        portOffset = ip.transportOffset + 2,
+                        portOld = translatedDestinationPort, portNew = session.origSrcPort,
+                        rewriteSourcePort = false
+                    )) return false
+
+                if (!decrementTtlAndRefreshIpChecksum(packet, ip)) return false
+                session.lastSeenMs = System.currentTimeMillis()
+                return true
+            }
+
+            PROTO_ICMP -> {
+                val type = u8(packet, ip.transportOffset)
+                val code = u8(packet, ip.transportOffset + 1)
+                if (type != ICMP_ECHO_REPLY || code != 0) return false
+                val translatedId = readU16(packet, ip.transportOffset + 4)
+                val key = ReverseKey(PROTO_ICMP, ip.sourceIp, 0, adapterIp, translatedId)
+                val session = reverse[key] ?: return false
+
+                rewriteIpv4AddressAndTransportChecksum(
+                    packet, ip, source = false,
+                    oldIp = adapterIp, newIp = ipToLong(session.origSrcIp, 0),
+                    transportWordOffset = ip.transportOffset + 4,
+                    oldTransportWord = translatedId, newTransportWord = session.origSrcPort
+                )
+                if (!decrementTtlAndRefreshIpChecksum(packet, ip)) return false
+                session.lastSeenMs = System.currentTimeMillis()
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun findOrCreateSession(
+        forwardKey: ForwardKey,
+        protocol: Int,
+        originalSourceIp: Long,
+        originalSourcePortOrId: Int,
+        remoteIp: Long,
+        remotePort: Int,
+        adapterIp: Long,
+        preferredTranslatedPort: Int
+    ): NatSession? = synchronized(allocationLock) {
+        val existing = forward[forwardKey]
+        if (existing != null) {
+            existing.lastSeenMs = System.currentTimeMillis()
+            return@synchronized existing
+        }
+
+        val translated = allocateTranslatedPort(
+            protocol, remoteIp, remotePort, adapterIp, preferredTranslatedPort
+        ) ?: return@synchronized null
+
+        val session = NatSession(
+            protocol = protocol,
+            origSrcIp = longToIp(originalSourceIp),
+            origSrcPort = originalSourcePortOrId,
+            targetDstIp = longToIp(remoteIp),
+            targetDstPort = remotePort,
+            masqPort = translated
+        )
+        val reverseKey = ReverseKey(protocol, remoteIp, remotePort, adapterIp, translated)
+        forward[forwardKey] = session
+        reverse[reverseKey] = session
+        session
+    }
+
+    private fun allocateTranslatedPort(
+        protocol: Int,
+        remoteIp: Long,
+        remotePort: Int,
+        adapterIp: Long,
+        preferred: Int
+    ): Int? {
+        fun available(candidate: Int): Boolean =
+            candidate in 0..65535 &&
+                !reverse.containsKey(ReverseKey(protocol, remoteIp, remotePort, adapterIp, candidate))
+
+        if (available(preferred)) return preferred
+
+        val span = LAST_DYNAMIC_PORT - FIRST_DYNAMIC_PORT + 1
+        repeat(span) {
+            var candidate = nextPort.incrementAndGet()
+            if (candidate > LAST_DYNAMIC_PORT) {
+                nextPort.set(FIRST_DYNAMIC_PORT)
+                candidate = FIRST_DYNAMIC_PORT
+            }
+            if (available(candidate)) return candidate
+        }
+        return null
     }
 
     private fun cleanExpiredSessions() {
         val now = System.currentTimeMillis()
-        val expired = natByMasqPort.filterValues { now - it.lastSeenMs > SESSION_TIMEOUT_MS }
-        for ((port, session) in expired) {
-            natByMasqPort.remove(port)
-            val clientKey = "${session.protocol}:${ArpEngine.formatIp(session.origSrcIp)}:${session.origSrcPort}:${session.targetDstPort}"
-            natByClient.remove(clientKey)
+        for ((key, session) in forward.entries) {
+            if (now - session.lastSeenMs <= SESSION_TIMEOUT_MS) continue
+            if (forward.remove(key, session)) {
+                val adapterIp = parseIpv4Address(config.adapterIp)?.let { ipToLong(it, 0) } ?: continue
+                val remoteIp = ipToLong(session.targetDstIp, 0)
+                val remotePort = if (session.protocol == PROTO_ICMP) 0 else session.targetDstPort
+                reverse.remove(
+                    ReverseKey(session.protocol, remoteIp, remotePort, adapterIp, session.masqPort),
+                    session
+                )
+            }
         }
     }
 
-    /**
-     * Outgoing: Host / VPN / Tailscale ➔ HMI (192.168.1.12)
-     * Performs Masquerade (SNAT): rewrites Source IP to 192.168.1.100.
-     * Also clamps TCP MSS to target (e.g. 1360 B).
-     * 
-     * @param packet Raw IPv4 packet
-     * @param offset Offset where IPv4 header starts
-     * @param length Length of IPv4 packet
-     * @return true if packet was successfully masqueraded and ready for Ethernet encapsulation
-     */
-    fun processOutgoingPacket(packet: ByteArray, offset: Int, length: Int): Boolean {
-        if (length < 20) return false
-        val versionAndIhl = packet[offset].toInt() and 0xFF
-        if ((versionAndIhl shr 4) != 4) return false
-        val ihl = (versionAndIhl and 0x0F) * 4
-        if (ihl < 20 || offset + ihl > offset + length) return false
+    private fun parseIpv4(packet: ByteArray, offset: Int, length: Int): Ipv4View? {
+        if (offset < 0 || length < 20 || offset > packet.size - length) return null
+        val versionAndIhl = u8(packet, offset)
+        if ((versionAndIhl ushr 4) != 4) return null
+        val headerLength = (versionAndIhl and 0x0F) * 4
+        if (headerLength < 20 || headerLength > length) return null
 
-        val protocol = packet[offset + 9].toInt() and 0xFF
-        val origSrcIp = ByteArray(4)
-        System.arraycopy(packet, offset + 12, origSrcIp, 0, 4)
-        val dstIp = ByteArray(4)
-        System.arraycopy(packet, offset + 16, dstIp, 0, 4)
+        val totalLength = readU16(packet, offset + 2)
+        if (totalLength < headerLength || totalLength > length) return null
 
-        val adapterIp = ArpEngine.parseIp(config.adapterIp)
+        // Fragment offset or MF means this packet cannot be translated safely here.
+        // DF is allowed; the reserved flag is rejected.
+        val flagsAndOffset = readU16(packet, offset + 6)
+        if ((flagsAndOffset and 0xBFFF) != 0) return null
 
-        // If packet is already from 192.168.1.100, no SNAT needed (just MSS clamp if TCP)
-        if (origSrcIp.contentEquals(adapterIp)) {
-            if (protocol == 6 && config.isMssClampingEnabled) {
-                MssClamper.clampMssInPlace(packet, offset, length, config.targetMss)
+        if (ChecksumUtils.computeIpChecksum(packet, offset, headerLength) != 0) return null
+        val transportLength = totalLength - headerLength
+        val protocol = u8(packet, offset + 9)
+        return Ipv4View(
+            offset = offset,
+            headerLength = headerLength,
+            totalLength = totalLength,
+            protocol = protocol,
+            sourceIp = ipToLong(packet, offset + 12),
+            destinationIp = ipToLong(packet, offset + 16),
+            transportOffset = offset + headerLength,
+            transportLength = transportLength
+        )
+    }
+
+    private fun validTransport(packet: ByteArray, ip: Ipv4View, outbound: Boolean): Boolean {
+        val l4 = ip.transportOffset
+        val length = ip.transportLength
+        return when (ip.protocol) {
+            PROTO_TCP -> {
+                if (length < 20) return false
+                val tcpHeaderLength = (u8(packet, l4 + 12) ushr 4) * 4
+                if (tcpHeaderLength < 20 || tcpHeaderLength > length) return false
+                transportChecksumValid(packet, ip, length, 16, false)
             }
-            return true
+            PROTO_UDP -> {
+                if (length < 8) return false
+                val udpLength = readU16(packet, l4 + 4)
+                if (udpLength != length || udpLength < 8) return false
+                val checksum = readU16(packet, l4 + 6)
+                checksum == 0 || transportChecksumValid(packet, ip, udpLength, 6, true)
+            }
+            PROTO_ICMP -> {
+                if (length < 8) return false
+                val type = u8(packet, l4)
+                val code = u8(packet, l4 + 1)
+                val expectedType = if (outbound) ICMP_ECHO_REQUEST else ICMP_ECHO_REPLY
+                type == expectedType && code == 0 &&
+                    ChecksumUtils.computeIpChecksum(packet, l4, length) == 0
+            }
+            else -> false
         }
+    }
 
-        // Handle TCP and UDP
-        if (protocol == 6 || protocol == 17) {
-            val l4Offset = offset + ihl
-            if (l4Offset + 4 > offset + length) return false
+    private fun transportChecksumValid(
+        packet: ByteArray,
+        ip: Ipv4View,
+        transportLength: Int,
+        checksumOffset: Int,
+        udp: Boolean
+    ): Boolean {
+        val checksum = readU16(packet, ip.transportOffset + checksumOffset)
+        if (udp && checksum == 0) return true
+        var sum = 0L
+        sum += (ip.sourceIp ushr 16) and 0xFFFF
+        sum += ip.sourceIp and 0xFFFF
+        sum += (ip.destinationIp ushr 16) and 0xFFFF
+        sum += ip.destinationIp and 0xFFFF
+        sum += ip.protocol.toLong()
+        sum += transportLength.toLong()
 
-            val origSrcPort = ((packet[l4Offset].toInt() and 0xFF) shl 8) or (packet[l4Offset + 1].toInt() and 0xFF)
-            val dstPort = ((packet[l4Offset + 2].toInt() and 0xFF) shl 8) or (packet[l4Offset + 3].toInt() and 0xFF)
-
-            val clientKey = "$protocol:${ArpEngine.formatIp(origSrcIp)}:$origSrcPort:$dstPort"
-            var masqPort = natByClient[clientKey]
-
-            if (masqPort == null || !natByMasqPort.containsKey(masqPort)) {
-                // Allocate a masquerade port (try preserving original port first)
-                masqPort = if (!natByMasqPort.containsKey(origSrcPort) && origSrcPort in 1024..65535) {
-                    origSrcPort
-                } else {
-                    allocatePort()
-                }
-
-                val session = NatSession(
-                    protocol = protocol,
-                    origSrcIp = origSrcIp,
-                    origSrcPort = origSrcPort,
-                    targetDstIp = dstIp,
-                    targetDstPort = dstPort,
-                    masqPort = masqPort,
-                    lastSeenMs = System.currentTimeMillis()
-                )
-                natByMasqPort[masqPort] = session
-                natByClient[clientKey] = masqPort
-            } else {
-                natByMasqPort[masqPort]?.lastSeenMs = System.currentTimeMillis()
-            }
-
-            // 1. Clamping MSS on TCP SYN before checksum modification
-            if (protocol == 6 && config.isMssClampingEnabled) {
-                MssClamper.clampMssInPlace(packet, offset, length, config.targetMss)
-            }
-
-            // 2. Perform Source IP rewrite: origSrcIp ➔ adapterIp (192.168.1.100)
-            applySnat(packet, offset, ihl, l4Offset, origSrcIp, adapterIp, origSrcPort, masqPort, protocol)
-            return true
-        } else if (protocol == 1) { // ICMP Echo
-            // Rewrite Source IP to 192.168.1.100 and update IP checksum
-            applyIpOnlySnat(packet, offset, ihl, origSrcIp, adapterIp)
-            return true
+        var p = ip.transportOffset
+        val end = p + transportLength
+        while (p + 1 < end) {
+            sum += ((u8(packet, p) shl 8) or u8(packet, p + 1)).toLong()
+            p += 2
         }
+        if (p < end) sum += (u8(packet, p) shl 8).toLong()
+        while ((sum ushr 16) != 0L) sum = (sum and 0xFFFFL) + (sum ushr 16)
+        return sum == 0xFFFFL
+    }
 
+    private fun rewriteTransportAddressAndPort(
+        packet: ByteArray,
+        ip: Ipv4View,
+        oldSourceIp: Long,
+        newSourceIp: Long,
+        oldDestinationIp: Long,
+        newDestinationIp: Long,
+        portOffset: Int,
+        portOld: Int,
+        portNew: Int,
+        rewriteSourcePort: Boolean
+    ): Boolean {
+        val checksumOffset = when (ip.protocol) {
+            PROTO_TCP -> ip.transportOffset + 16
+            PROTO_UDP -> ip.transportOffset + 6
+            else -> return false
+        }
+        var checksum = readU16(packet, checksumOffset)
+        val isUdpZero = ip.protocol == PROTO_UDP && checksum == 0
+        if (!isUdpZero) {
+            checksum = updateChecksumForAddress(checksum, oldSourceIp, newSourceIp)
+            checksum = updateChecksumForAddress(checksum, oldDestinationIp, newDestinationIp)
+            checksum = ChecksumUtils.updateChecksum16(checksum, portOld, portNew)
+            if (ip.protocol == PROTO_UDP && checksum == 0) checksum = 0xFFFF
+            writeU16(packet, checksumOffset, checksum)
+        }
+        if (rewriteSourcePort) writeU16(packet, portOffset, portNew)
+        else writeU16(packet, portOffset, portNew)
+
+        if (newSourceIp != oldSourceIp) writeIp(packet, ip.offset + 12, newSourceIp)
+        if (newDestinationIp != oldDestinationIp) writeIp(packet, ip.offset + 16, newDestinationIp)
         return true
     }
 
-    /**
-     * Incoming: HMI (192.168.1.12) ➔ Host / VPN / Tailscale
-     * Performs Reverse NAT (DNAT): rewrites Destination IP from 192.168.1.100 back to origSrcIp (100.64.X.X).
-     * 
-     * @param packet Raw IPv4 packet (after Ethernet header is stripped)
-     * @param offset Offset where IPv4 header starts
-     * @param length Length of IPv4 packet
-     * @return true if packet was successfully de-masqueraded and ready for injection into tunnel
-     */
-    fun processIncomingPacket(packet: ByteArray, offset: Int, length: Int): Boolean {
-        if (length < 20) return false
-        val versionAndIhl = packet[offset].toInt() and 0xFF
-        if ((versionAndIhl shr 4) != 4) return false
-        val ihl = (versionAndIhl and 0x0F) * 4
-        if (ihl < 20 || offset + ihl > offset + length) return false
-
-        val protocol = packet[offset + 9].toInt() and 0xFF
-        val dstIp = ByteArray(4)
-        System.arraycopy(packet, offset + 16, dstIp, 0, 4)
-        val adapterIp = ArpEngine.parseIp(config.adapterIp)
-
-        // Only de-masquerade packets targeting our virtual adapter IP (192.168.1.100)
-        if (!dstIp.contentEquals(adapterIp)) return false
-
-        if (protocol == 6 || protocol == 17) {
-            val l4Offset = offset + ihl
-            if (l4Offset + 4 > offset + length) return false
-
-            val srcPort = ((packet[l4Offset].toInt() and 0xFF) shl 8) or (packet[l4Offset + 1].toInt() and 0xFF)
-            val masqDstPort = ((packet[l4Offset + 2].toInt() and 0xFF) shl 8) or (packet[l4Offset + 3].toInt() and 0xFF)
-
-            val session = natByMasqPort[masqDstPort] ?: run {
-                // If FTPS dynamic passive port was pre-registered or matches active ALG
-                if (ftpsAlg.isDynamicPortActive(masqDstPort)) {
-                    // Fallback to most recent session for HMI
-                    val fallback = natByMasqPort.values.firstOrNull { it.targetDstPort == 21 || it.targetDstPort == 8000 }
-                    fallback?.copy(masqPort = masqDstPort, origSrcPort = masqDstPort)
-                } else {
-                    null
-                }
-            }
-
-            if (session == null) {
-                Log.w(TAG, "No NAT session for incoming packet on port $masqDstPort (protocol=$protocol)")
-                return false
-            }
-
-            session.lastSeenMs = System.currentTimeMillis()
-
-            // Check if HMI is sending FTPS passive reply (227 Entering Passive Mode)
-            if (protocol == 6 && (srcPort == 21 || srcPort == 8000)) {
-                val tcpDataOffset = ((packet[l4Offset + 12].toInt() and 0xF0) shr 4) * 4
-                val payloadOffset = l4Offset + tcpDataOffset
-                val payloadLen = length - (ihl + tcpDataOffset)
-                if (payloadLen > 0 && payloadOffset + payloadLen <= offset + length) {
-                    val pasvPort = ftpsAlg.inspectPayload(packet, payloadOffset, payloadLen)
-                    if (pasvPort != null) {
-                        Log.i(TAG, "FTPS ALG registered dynamic passive port: $pasvPort for GP-Pro EX")
-                        // Pre-register dynamic NAT mapping for GP-Pro EX host
-                        registerDynamicPasvSession(session.origSrcIp, pasvPort)
-                    }
-                }
-            }
-
-            // Perform Reverse DNAT: 192.168.1.100:masqDstPort ➔ origSrcIp:origSrcPort
-            applyDnat(packet, offset, ihl, l4Offset, adapterIp, session.origSrcIp, masqDstPort, session.origSrcPort, protocol)
-            return true
-        }
-
-        return false
-    }
-
-    private fun registerDynamicPasvSession(clientIp: ByteArray, port: Int) {
-        val session = NatSession(
-            protocol = 6,
-            origSrcIp = clientIp,
-            origSrcPort = port,
-            targetDstIp = ArpEngine.parseIp(config.targetPlcIp),
-            targetDstPort = port,
-            masqPort = port,
-            lastSeenMs = System.currentTimeMillis()
-        )
-        natByMasqPort[port] = session
-        val clientKey = "6:${ArpEngine.formatIp(clientIp)}:$port:$port"
-        natByClient[clientKey] = port
-    }
-
-    private fun allocatePort(): Int {
-        var p = portCounter.incrementAndGet()
-        if (p > 65000) {
-            portCounter.set(45000)
-            p = 45000
-        }
-        return p
-    }
-
-    /**
-     * SNAT: Replaces Source IP (and optionally Source Port) in IPv4 + TCP/UDP header.
-     * Updates checksums incrementally (RFC 1624).
-     */
-    private fun applySnat(
+    private fun rewriteIpv4AddressAndTransportChecksum(
         packet: ByteArray,
-        ipOffset: Int,
-        ihl: Int,
-        l4Offset: Int,
-        oldIp: ByteArray,
-        newIp: ByteArray,
-        oldPort: Int,
-        newPort: Int,
-        protocol: Int
+        ip: Ipv4View,
+        source: Boolean,
+        oldIp: Long,
+        newIp: Long,
+        transportWordOffset: Int,
+        oldTransportWord: Int,
+        newTransportWord: Int
     ) {
-        // 1. Update IPv4 Header Checksum
-        val oldIpChecksum = ((packet[ipOffset + 10].toInt() and 0xFF) shl 8) or (packet[ipOffset + 11].toInt() and 0xFF)
-        val oldIpWord1 = ((oldIp[0].toInt() and 0xFF) shl 8) or (oldIp[1].toInt() and 0xFF)
-        val oldIpWord2 = ((oldIp[2].toInt() and 0xFF) shl 8) or (oldIp[3].toInt() and 0xFF)
-        val newIpWord1 = ((newIp[0].toInt() and 0xFF) shl 8) or (newIp[1].toInt() and 0xFF)
-        val newIpWord2 = ((newIp[2].toInt() and 0xFF) shl 8) or (newIp[3].toInt() and 0xFF)
+        val checksumOffset = ip.transportOffset + 2
+        var checksum = readU16(packet, checksumOffset)
+        checksum = ChecksumUtils.updateChecksum16(checksum, oldTransportWord, newTransportWord)
+        writeU16(packet, checksumOffset, checksum)
+        writeU16(packet, transportWordOffset, newTransportWord)
+        writeIp(packet, ip.offset + if (source) 12 else 16, newIp)
+    }
 
-        var newIpChecksum = ChecksumUtils.updateChecksum16(oldIpChecksum, oldIpWord1, newIpWord1)
-        newIpChecksum = ChecksumUtils.updateChecksum16(newIpChecksum, oldIpWord2, newIpWord2)
+    private fun updateChecksumForAddress(checksum: Int, oldIp: Long, newIp: Long): Int {
+        var updated = ChecksumUtils.updateChecksum16(checksum, ((oldIp ushr 16) and 0xFFFF).toInt(),
+            ((newIp ushr 16) and 0xFFFF).toInt())
+        updated = ChecksumUtils.updateChecksum16(updated, (oldIp and 0xFFFF).toInt(),
+            (newIp and 0xFFFF).toInt())
+        return updated
+    }
 
-        packet[ipOffset + 10] = ((newIpChecksum shr 8) and 0xFF).toByte()
-        packet[ipOffset + 11] = (newIpChecksum and 0xFF).toByte()
+    private fun decrementTtlAndRefreshIpChecksum(packet: ByteArray, ip: Ipv4View): Boolean {
+        val ttl = u8(packet, ip.offset + 8)
+        if (ttl <= 1) return false
+        packet[ip.offset + 8] = (ttl - 1).toByte()
+        writeU16(packet, ip.offset + 10, 0)
+        val checksum = ChecksumUtils.computeIpChecksum(packet, ip.offset, ip.headerLength)
+        writeU16(packet, ip.offset + 10, checksum)
+        return true
+    }
 
-        // Write new Source IP
-        System.arraycopy(newIp, 0, packet, ipOffset + 12, 4)
+    private fun writeIp(packet: ByteArray, offset: Int, ip: Long) {
+        packet[offset] = (ip ushr 24).toByte()
+        packet[offset + 1] = (ip ushr 16).toByte()
+        packet[offset + 2] = (ip ushr 8).toByte()
+        packet[offset + 3] = ip.toByte()
+    }
 
-        // 2. Update TCP or UDP Checksum
-        val csumOffset = if (protocol == 6) l4Offset + 16 else l4Offset + 6
-        var l4Checksum = ((packet[csumOffset].toInt() and 0xFF) shl 8) or (packet[csumOffset + 1].toInt() and 0xFF)
+    private fun readU16(packet: ByteArray, offset: Int): Int =
+        (u8(packet, offset) shl 8) or u8(packet, offset + 1)
 
-        if (protocol != 17 || l4Checksum != 0) { // If UDP checksum is 0, it means disabled
-            // Update for Source IP change in pseudo-header
-            l4Checksum = ChecksumUtils.updateChecksum16(l4Checksum, oldIpWord1, newIpWord1)
-            l4Checksum = ChecksumUtils.updateChecksum16(l4Checksum, oldIpWord2, newIpWord2)
+    private fun writeU16(packet: ByteArray, offset: Int, value: Int) {
+        packet[offset] = (value ushr 8).toByte()
+        packet[offset + 1] = value.toByte()
+    }
 
-            // Update for Source Port change if needed
-            if (oldPort != newPort) {
-                l4Checksum = ChecksumUtils.updateChecksum16(l4Checksum, oldPort, newPort)
-                packet[l4Offset] = ((newPort shr 8) and 0xFF).toByte()
-                packet[l4Offset + 1] = (newPort and 0xFF).toByte()
-            }
+    private fun u8(packet: ByteArray, offset: Int): Int = packet[offset].toInt() and 0xFF
 
-            packet[csumOffset] = ((l4Checksum shr 8) and 0xFF).toByte()
-            packet[csumOffset + 1] = (l4Checksum and 0xFF).toByte()
+    private fun ipToLong(bytes: ByteArray, offset: Int): Long =
+        ((u8(bytes, offset).toLong() shl 24) or
+            (u8(bytes, offset + 1).toLong() shl 16) or
+            (u8(bytes, offset + 2).toLong() shl 8) or
+            u8(bytes, offset + 3).toLong())
+
+    private fun longToIp(ip: Long): ByteArray = byteArrayOf(
+        (ip ushr 24).toByte(), (ip ushr 16).toByte(), (ip ushr 8).toByte(), ip.toByte()
+    )
+
+    private fun parseIpv4Address(value: String): ByteArray? {
+        val parts = value.split(".")
+        if (parts.size != 4) return null
+        val bytes = ByteArray(4)
+        for (i in 0..3) {
+            val part = parts[i].toIntOrNull() ?: return null
+            if (part !in 0..255) return null
+            bytes[i] = part.toByte()
         }
+        return bytes
     }
 
-    /**
-     * DNAT: Replaces Destination IP (and optionally Destination Port) in IPv4 + TCP/UDP header.
-     * Updates checksums incrementally (RFC 1624).
-     */
-    private fun applyDnat(
-        packet: ByteArray,
-        ipOffset: Int,
-        ihl: Int,
-        l4Offset: Int,
-        oldIp: ByteArray,
-        newIp: ByteArray,
-        oldPort: Int,
-        newPort: Int,
-        protocol: Int
-    ) {
-        // 1. Update IPv4 Header Checksum
-        val oldIpChecksum = ((packet[ipOffset + 10].toInt() and 0xFF) shl 8) or (packet[ipOffset + 11].toInt() and 0xFF)
-        val oldIpWord1 = ((oldIp[0].toInt() and 0xFF) shl 8) or (oldIp[1].toInt() and 0xFF)
-        val oldIpWord2 = ((oldIp[2].toInt() and 0xFF) shl 8) or (oldIp[3].toInt() and 0xFF)
-        val newIpWord1 = ((newIp[0].toInt() and 0xFF) shl 8) or (newIp[1].toInt() and 0xFF)
-        val newIpWord2 = ((newIp[2].toInt() and 0xFF) shl 8) or (newIp[3].toInt() and 0xFF)
-
-        var newIpChecksum = ChecksumUtils.updateChecksum16(oldIpChecksum, oldIpWord1, newIpWord1)
-        newIpChecksum = ChecksumUtils.updateChecksum16(newIpChecksum, oldIpWord2, newIpWord2)
-
-        packet[ipOffset + 10] = ((newIpChecksum shr 8) and 0xFF).toByte()
-        packet[ipOffset + 11] = (newIpChecksum and 0xFF).toByte()
-
-        // Write new Destination IP
-        System.arraycopy(newIp, 0, packet, ipOffset + 16, 4)
-
-        // 2. Update TCP or UDP Checksum
-        val csumOffset = if (protocol == 6) l4Offset + 16 else l4Offset + 6
-        var l4Checksum = ((packet[csumOffset].toInt() and 0xFF) shl 8) or (packet[csumOffset + 1].toInt() and 0xFF)
-
-        if (protocol != 17 || l4Checksum != 0) {
-            // Update for Destination IP change in pseudo-header
-            l4Checksum = ChecksumUtils.updateChecksum16(l4Checksum, oldIpWord1, newIpWord1)
-            l4Checksum = ChecksumUtils.updateChecksum16(l4Checksum, oldIpWord2, newIpWord2)
-
-            // Update for Destination Port change if needed
-            if (oldPort != newPort) {
-                l4Checksum = ChecksumUtils.updateChecksum16(l4Checksum, oldPort, newPort)
-                packet[l4Offset + 2] = ((newPort shr 8) and 0xFF).toByte()
-                packet[l4Offset + 3] = (newPort and 0xFF).toByte()
-            }
-
-            packet[csumOffset] = ((l4Checksum shr 8) and 0xFF).toByte()
-            packet[csumOffset + 1] = (l4Checksum and 0xFF).toByte()
-        }
-    }
-
-    private fun applyIpOnlySnat(packet: ByteArray, ipOffset: Int, ihl: Int, oldIp: ByteArray, newIp: ByteArray) {
-        val oldIpChecksum = ((packet[ipOffset + 10].toInt() and 0xFF) shl 8) or (packet[ipOffset + 11].toInt() and 0xFF)
-        val oldIpWord1 = ((oldIp[0].toInt() and 0xFF) shl 8) or (oldIp[1].toInt() and 0xFF)
-        val oldIpWord2 = ((oldIp[2].toInt() and 0xFF) shl 8) or (oldIp[3].toInt() and 0xFF)
-        val newIpWord1 = ((newIp[0].toInt() and 0xFF) shl 8) or (newIp[1].toInt() and 0xFF)
-        val newIpWord2 = ((newIp[2].toInt() and 0xFF) shl 8) or (newIp[3].toInt() and 0xFF)
-
-        var newIpChecksum = ChecksumUtils.updateChecksum16(oldIpChecksum, oldIpWord1, newIpWord1)
-        newIpChecksum = ChecksumUtils.updateChecksum16(newIpChecksum, oldIpWord2, newIpWord2)
-
-        packet[ipOffset + 10] = ((newIpChecksum shr 8) and 0xFF).toByte()
-        packet[ipOffset + 11] = (newIpChecksum and 0xFF).toByte()
-        System.arraycopy(newIp, 0, packet, ipOffset + 12, 4)
-    }
+    private fun ipTtl(packet: ByteArray, offset: Int): Int = u8(packet, offset + 8)
+    private fun Ipv4View.ttl(packet: ByteArray): Int = ipTtl(packet, offset)
 }
