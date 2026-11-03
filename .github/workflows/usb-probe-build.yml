@@ -31,6 +31,8 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "9.3.1"
+      - name: Run USB Probe unit tests
+        run: gradle :usb_probe:testDebugUnitTest --no-configuration-cache
       - name: Build probe APK
         run: gradle :usb_probe:assembleDebug --no-configuration-cache
       - name: Upload debug APK
