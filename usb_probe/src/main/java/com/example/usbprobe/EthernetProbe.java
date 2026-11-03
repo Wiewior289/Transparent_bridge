@@ -251,7 +251,7 @@ final class EthernetProbe {
         int allZero = (ip[0] | ip[1] | ip[2] | ip[3]) & 255;
         int allOnes = (ip[0] & ip[1] & ip[2] & ip[3]) & 255;
         return allZero != 0 && allOnes != 255 &&
-                first != 0 && first != 127 && (first < 224 || first > 239);
+                first != 0 && first != 127 && first < 224;
     }
 
     private static void requireLength(byte[] value, int length, String label) {
