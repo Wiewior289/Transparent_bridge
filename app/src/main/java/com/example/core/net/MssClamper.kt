@@ -12,22 +12,25 @@ object MssClamper {
      * @param buffer Raw IPv4 packet buffer
      * @param offset Offset where IPv4 header starts
      * @param length Total length of the IPv4 packet
-     * @param targetMss Clamped MSS value (typically 1360 for WireGuard / Tailscale)
+     * @param targetMss Maximum MSS derived from the effective path MTU (e.g. 1320 for MTU 1360 IPv4/TCP)
      * @return true if MSS was found and clamped
      */
     fun clampMssInPlace(buffer: ByteArray, offset: Int, length: Int, targetMss: Int = 1360): Boolean {
-        if (length < 40) return false // Min IPv4 (20) + min TCP (20)
-        
+        if (offset < 0 || length < 40 || offset > buffer.size - length) return false
+
         val versionAndIhl = buffer[offset].toInt() and 0xFF
         if ((versionAndIhl shr 4) != 4) return false // Not IPv4
         val ipHeaderLen = (versionAndIhl and 0x0F) * 4
-        if (ipHeaderLen < 20 || offset + ipHeaderLen > buffer.size) return false
-        
+        if (ipHeaderLen < 20 || offset + ipHeaderLen > offset + length) return false
+        val ipTotalLength = ((buffer[offset + 2].toInt() and 0xFF) shl 8) or
+            (buffer[offset + 3].toInt() and 0xFF)
+        if (ipTotalLength < ipHeaderLen + 20 || ipTotalLength > length) return false
+
         val protocol = buffer[offset + 9].toInt() and 0xFF
         if (protocol != 6) return false // Not TCP
         
         val tcpOffset = offset + ipHeaderLen
-        if (tcpOffset + 20 > offset + length) return false
+        if (tcpOffset + 20 > offset + ipTotalLength) return false
         
         val tcpFlags = buffer[tcpOffset + 13].toInt() and 0xFF
         val isSyn = (tcpFlags and 0x02) != 0
@@ -38,7 +41,7 @@ object MssClamper {
         if (dataOffsetBytes <= 20) return false // No TCP options present
         
         val optionsEnd = tcpOffset + dataOffsetBytes
-        if (optionsEnd > offset + length) return false
+        if (optionsEnd > offset + ipTotalLength) return false
         
         var optIdx = tcpOffset + 20
         var modified = false
@@ -57,7 +60,7 @@ object MssClamper {
             if (kind == 2 && optLen == 4) { // MSS Option
                 val oldMss = ((buffer[optIdx + 2].toInt() and 0xFF) shl 8) or (buffer[optIdx + 3].toInt() and 0xFF)
                 if (oldMss > targetMss) {
-                    val newMss = targetMss
+                    val newMss = targetMss.coerceIn(1, 0xFFFF)
                     val oldWord = oldMss
                     val newWord = newMss
                     
