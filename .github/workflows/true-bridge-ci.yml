@@ -51,6 +51,9 @@ jobs:
       - name: Test USB probe packet logic
         run: gradle :usb_probe:testDebugUnitTest --no-configuration-cache
 
+      - name: Test shared CDC-ECM RX accounting
+        run: gradle :usb_ecm:testDebugUnitTest --no-configuration-cache
+
       - name: Build shared CDC-ECM library
         run: gradle :usb_ecm:assembleDebug --no-configuration-cache
 
