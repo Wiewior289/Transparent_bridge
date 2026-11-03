@@ -22,5 +22,6 @@ android {
 }
 
 dependencies {
+    implementation(project(":usb_ecm"))
     testImplementation(libs.junit)
 }
