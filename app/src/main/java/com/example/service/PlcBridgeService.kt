@@ -282,7 +282,7 @@ class PlcBridgeService : Service() {
 
     /**
      * Handles outgoing IPv4 packets from TUN / Tailscale / Host.
-     * Applies Userland SNAT (Masquerade) to 192.168.1.100, clamps MSS to 1360,
+     * Applies validated Userland SNAT (Masquerade) to the USB adapter address and clamps TCP MSS to the effective MTU,
      * encapsulates in 14-byte Ethernet frame, and sends to USB Bulk OUT.
      */
     fun handleOutgoingIpPacketFromTun(packet: ByteArray, length: Int) {
