@@ -71,7 +71,6 @@ import com.example.ui.theme.TextSecondary
 fun SettingsScreen(viewModel: PlcBridgeViewModel) {
     val context = LocalContext.current
     var autoStartUsb by remember { mutableStateOf(true) }
-    var ringBufferSize by remember { mutableIntStateOf(2048) }
     var keepCpuAwake by remember { mutableStateOf(true) }
 
     val powerManager = remember { context.getSystemService(Context.POWER_SERVICE) as PowerManager }
@@ -165,72 +164,6 @@ fun SettingsScreen(viewModel: PlcBridgeViewModel) {
                         Text("Disable Battery Optimization", fontWeight = FontWeight.Bold)
                     }
                 }
-            }
-        }
-
-        // Ring Buffer Memory Allocation
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = SurfaceDark),
-            border = androidx.compose.foundation.BorderStroke(1.dp, OutlineDark),
-            shape = RoundedCornerShape(16.dp)
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column {
-                        Text(
-                            text = "PRE-ALLOCATED RING BUFFER",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = IndustrialCyan,
-                            letterSpacing = 1.sp
-                        )
-                        Text(
-                            text = "Zero-Copy RAM Pool Size",
-                            fontSize = 12.sp,
-                            color = TextSecondary
-                        )
-                    }
-
-                    Icon(
-                        imageVector = Icons.Default.Memory,
-                        contentDescription = null,
-                        tint = IndustrialCyan
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(12.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    listOf(512, 1024, 2048, 4096).forEach { size ->
-                        FilterChip(
-                            selected = ringBufferSize == size,
-                            onClick = { ringBufferSize = size },
-                            label = { Text("$size pkts", fontSize = 11.sp) },
-                            colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = IndustrialCyan.copy(alpha = 0.2f),
-                                selectedLabelColor = IndustrialCyan
-                            )
-                        )
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                val ramMb = "%.2f".format((ringBufferSize * 1600.0) / (1024 * 1024))
-                Text(
-                    text = "Allocated RAM: $ramMb MB (Flat, static, zero GC pressure)",
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                    color = IndustrialEmerald
-                )
             }
         }
 
