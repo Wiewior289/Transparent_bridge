@@ -226,7 +226,7 @@ class PlcBridgeViewModel(application: Application) : AndroidViewModel(applicatio
                 targetIp = "192.168.1.12",
                 vendor = "Schneider / Pro-face",
                 defaultPorts = listOf(21, 8000),
-                description = "FTPS / FTP dynamic PASV data ports & GP-Pro EX Project Download/Receive/Monitor"
+                description = "Transparent IP forwarding for GP-Pro EX project transfer, monitoring and PLC communication"
             ),
             PlcProfile(
                 id = "siemens_s7",
@@ -242,8 +242,7 @@ class PlcBridgeViewModel(application: Application) : AndroidViewModel(applicatio
                 targetIp = "192.168.1.50",
                 vendor = "Universal",
                 defaultPorts = listOf(502),
-                description = "Standard Modbus TCP master/slave communication port 502 with low latency framing",
-                isFtpsPasvNeeded = false
+                description = "Standard Modbus TCP master/slave communication port 502 with low latency framing"
             ),
             PlcProfile(
                 id = "omron_sysmac",
