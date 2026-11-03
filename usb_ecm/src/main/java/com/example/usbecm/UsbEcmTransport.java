@@ -46,8 +46,9 @@ public final class UsbEcmTransport implements AutoCloseable {
             binder = new CdcEcmBinder(connection, profile, sink::log);
             if (!binder.bind()) throw new IllegalStateException("CDC-ECM bind sequence failed");
 
-            String mac = readUsbString(connection, profile.macStringIndex, sink);
-            if (!validMac(mac)) throw new IllegalStateException("CDC iMACAddress string is absent or invalid");
+            String rawMac = readUsbString(connection, profile.macStringIndex, sink);
+            if (!validMac(rawMac)) throw new IllegalStateException("CDC iMACAddress string is absent or invalid");
+            String mac = canonicalMac(rawMac);
 
             sink.log("USB CDC-ECM transport ready config=" + profile.configurationValue +
                     " controlIF=" + profile.controlInterfaceNumber +
@@ -192,6 +193,16 @@ public final class UsbEcmTransport implements AutoCloseable {
         boolean allZero = true;
         for (byte valueByte : mac) allZero &= valueByte == 0;
         return !allZero;
+    }
+
+    private static String canonicalMac(String value) {
+        String normalized = value.replace(":", "").replace("-", "").toUpperCase(java.util.Locale.US);
+        StringBuilder out = new StringBuilder(17);
+        for (int i = 0; i < 6; i++) {
+            if (i != 0) out.append(':');
+            out.append(normalized, i * 2, i * 2 + 2);
+        }
+        return out.toString();
     }
 
     private static String hex(int value) {
