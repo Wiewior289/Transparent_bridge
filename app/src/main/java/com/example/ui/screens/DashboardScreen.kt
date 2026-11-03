@@ -76,7 +76,6 @@ fun DashboardScreen(
     val stats by viewModel.stats.collectAsState()
     val ethConfig by viewModel.ethernetConfig.collectAsState()
     val activeProfile by viewModel.activeProfile.collectAsState()
-    val ftpsPorts by viewModel.activeFtpsPorts.collectAsState()
     val usbDevices by viewModel.usbDevices.collectAsState()
 
     val isRunning = state == BridgeState.RUNNING
@@ -285,67 +284,6 @@ fun DashboardScreen(
                     fontSize = 12.sp,
                     color = TextSecondary
                 )
-            }
-        }
-
-        // FTPS Dynamic Passive Port Indicator
-        AnimatedVisibility(visible = ethConfig.isFtpsAlgEnabled) {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = SurfaceDark),
-                border = androidx.compose.foundation.BorderStroke(1.dp, OutlineDark),
-                shape = RoundedCornerShape(16.dp)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "FTPS ALG DYNAMIC PASSIVE PORTS",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = IndustrialAmber,
-                            letterSpacing = 1.sp
-                        )
-                        Text(
-                            text = if (ftpsPorts.isEmpty()) "IDLE" else "${ftpsPorts.size} OPEN",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = if (ftpsPorts.isEmpty()) TextMuted else IndustrialEmerald
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    if (ftpsPorts.isEmpty()) {
-                        Text(
-                            text = "GP-Pro EX uses PASV for transfer. When transfer begins, dynamic ports are auto-mapped without root iptables conntrack.",
-                            fontSize = 12.sp,
-                            color = TextSecondary
-                        )
-                    } else {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            ftpsPorts.forEach { port ->
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .background(IndustrialCyan.copy(alpha = 0.15f))
-                                        .padding(horizontal = 8.dp, vertical = 4.dp)
-                                ) {
-                                    Text(
-                                        text = ":$port",
-                                        fontFamily = FontFamily.Monospace,
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = IndustrialCyan
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
             }
         }
 
