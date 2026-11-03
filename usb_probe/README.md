@@ -1,10 +1,10 @@
 # CDC Ethernet Userland Probe
 
-Experimental standalone Android USB-host diagnostic for the generic CDC-ECM
-function exposed by WCH adapter 1A86:5394. This module is isolated from the
-production bridge. Its purpose is to exercise the CDC bind path and prove
-real Ethernet/IPv4 traffic over the adapter, not merely a successful USB API
-return value.
+Experimental Android USB-host diagnostic for the generic CDC-ECM function
+exposed by WCH adapter 1A86:5394. Descriptor discovery, CDC bind and frame RX/TX
+are implemented in the shared :usb_ecm Android library, which is also used by
+the production bridge. This module remains a lab UI for proving Ethernet/IPv4
+traffic over the adapter, not merely a successful USB API return value.
 
 ## CDC bind path
 
@@ -64,20 +64,21 @@ return alone is not treated as proof of peer delivery.
 
 ## TX/RX transport model
 
-TX frames are serialized through a bounded software queue. The code models the
-usbnet maxpacket termination rule: when a transfer length is an exact multiple
-of maxpacket, the generic CDC path without `FLAG_SEND_ZLP` uses the extra pad
-byte. This adapter's normal ARP and ICMP frames do not hit the 512-byte
-boundary case.
+TX frames are serialized through a bounded software queue and sent by
+`UsbEcmTransport.sendFrame()`. RX uses one blocking
+`UsbEcmTransport.receiveFrame()` call at a time and copies complete Ethernet
+frames into a bounded inspection queue. It dispatches each received frame to
+the ARP/ICMP probe state machine before trying to insert it into the UI queue.
 
-RX uses one blocking Android `UsbDeviceConnection.bulkTransfer()` call at a
-time and copies complete Ethernet frames into a bounded software queue. It
-also dispatches frames to the ARP/ICMP probe state machine.
+No ZLP or extra-byte padding is applied unconditionally. Exact maxpacket
+boundary behavior remains a separate adapter/driver compatibility test; the
+successful 60-byte ARP and 74-byte ICMP frames do not exercise that boundary.
 
-This is deliberately **not** a concurrent-URB port. Android's public USB Host
-API does not expose Linux URBs, completion callbacks, anchors, tasklets,
-unlink/drain, runtime-PM references or netdev delivery. The current RX worker
-does not reproduce usbnet's multi-URB concurrency or kernel network interface.
+The shared transport is deliberately **not** a concurrent-URB port. Android's
+public USB Host API does not expose Linux URBs, completion callbacks, anchors,
+tasklets, unlink/drain, runtime-PM references or netdev delivery. The current
+RX worker does not reproduce usbnet's multi-URB concurrency or kernel network
+interface.
 
 ## Lab test
 
