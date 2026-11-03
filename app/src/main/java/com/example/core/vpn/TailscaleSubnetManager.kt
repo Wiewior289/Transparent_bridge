@@ -3,6 +3,13 @@ package com.example.core.vpn
 import android.content.Context
 import android.util.Log
 import com.example.core.model.TailscaleConfig
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -13,7 +20,7 @@ import java.util.Locale
 /**
  * Tailscale Subnet Router Controller.
  * 
- * Direct JNI interface to the embedded Tailscale userspace engine (wgengine + ipnlocal) in /app/src/main/go/bridge.go.
+ * Direct JNI interface to the embedded Tailscale wgengine + ipnlocal backend in /app/src/main/go/bridge.go.
  * No HTTP client emulation or random IP generation.
  */
 class TailscaleSubnetManager(private val context: Context? = null) {
@@ -24,6 +31,8 @@ class TailscaleSubnetManager(private val context: Context? = null) {
     }
 
     private val prefs = context?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val monitorScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @Volatile private var stateMonitorJob: Job? = null
 
     private val _config = MutableStateFlow(
         TailscaleConfig(
@@ -56,11 +65,10 @@ class TailscaleSubnetManager(private val context: Context? = null) {
     }
 
     /**
-     * Starts the native Tailscale userspace engine via JNI and configures advertised subnet routes.
+     * Starts or reuses the native Tailscale LocalBackend and monitors its actual connection state.
      */
     fun startSubnetRouter(authKey: String, nodeName: String, routes: String) {
         val trimmedKey = authKey.trim().ifEmpty { prefs?.getString("auth_key", "") ?: "" }
-        val dataDir = context?.filesDir?.absolutePath ?: "/data/data/com.aistudio.plcbridge.vpexth/files"
 
         prefs?.edit()
             ?.putString("node_name", nodeName)
@@ -69,58 +77,142 @@ class TailscaleSubnetManager(private val context: Context? = null) {
             ?.apply()
 
         log("══════════════════════════════════════════════")
-        log("Starting embedded Tailscale userspace backend (wgengine/ipnlocal) via JNI...")
-        log("Node: $nodeName | Subnet: $routes")
-        log("Data directory: $dataDir")
-
-        _config.value = _config.value.copy(
-            nodeName = nodeName,
-            advertisedRoutes = routes,
-            authKey = trimmedKey
-        )
+        log("Tailscale runtime request: node=$nodeName routes=$routes")
+        log("AuthKey diagnostics: present=${trimmedKey.isNotEmpty()}, length=${trimmedKey.length}, tailscalePrefix=${trimmedKey.startsWith("tskey-")}")
 
         if (trimmedKey.isEmpty()) {
-            log("ERROR: Tailscale AuthKey is empty. Please enter your tskey-auth-... in Tailscale settings.")
-            return
-        }
-
-        if (TailscaleBridgeJni.isLibraryLoaded) {
-            try {
-                log("Calling TailscaleBridgeJni.startTsnet() for the embedded userspace backend...")
-                val res = TailscaleBridgeJni.startTsnet(trimmedKey, nodeName, routes, dataDir)
-                if (res > 0) {
-                    val tailnetIp = TailscaleBridgeJni.getAssignedTailnetIp()
-                    _config.value = _config.value.copy(
-                        isConnected = true,
-                        tailnetIp = tailnetIp,
-                        isSubnetRoutingActive = true
-                    )
-                    log("SUCCESS: embedded Tailscale userspace engine started; packet I/O is connected through UserlandTun/JNI.")
-                    log("Assigned Tailnet IP: $tailnetIp")
-                } else if (res == 0) {
-                    log("tsnet.Server is already running in RAM.")
-                    _config.value = _config.value.copy(isConnected = true, isSubnetRoutingActive = true)
-                } else {
-                    log("ERROR: embedded Tailscale userspace backend returned error code $res")
-                }
-            } catch (e: UnsatisfiedLinkError) {
-                log("JNI Linkage error: ${e.message}")
-            }
-        } else {
-            log("ERROR: tsnetbridge native library is not loaded; start aborted")
+            log("ERROR: AuthKey is empty; native start was not called.")
             _config.value = _config.value.copy(
+                nodeName = nodeName,
+                advertisedRoutes = routes,
+                authKey = "",
                 isConnected = false,
-                isSubnetRoutingActive = false
+                isSubnetRoutingActive = false,
+                tailnetIp = "0.0.0.0",
+                backendState = if (_config.value.isRuntimeStarted) _config.value.backendState else "STOPPED"
             )
             return
         }
 
-        log("══════════════════════════════════════════════")
-        log("REMINDER (Tailscale Admin Console):")
-        log("1. Open https://login.tailscale.com/admin/machines")
-        log("2. Find machine '$nodeName' ➔ Edit route settings")
-        log("3. Approve route '$routes'")
-        log("══════════════════════════════════════════════")
+        if (!TailscaleBridgeJni.isLibraryLoaded) {
+            log("ERROR: tsnetbridge native library is not loaded; start aborted.")
+            _config.value = _config.value.copy(
+                isConnected = false,
+                isSubnetRoutingActive = false,
+                isRuntimeStarted = false,
+                backendState = "STOPPED",
+                tailnetIp = "0.0.0.0"
+            )
+            return
+        }
+
+        try {
+            val previousState = TailscaleBridgeJni.getBackendState()
+            val wasRunning = previousState != "STOPPED"
+            _config.value = _config.value.copy(
+                nodeName = nodeName,
+                advertisedRoutes = routes,
+                authKey = trimmedKey,
+                backendState = previousState,
+                isRuntimeStarted = wasRunning,
+                isConnected = if (wasRunning) _config.value.isConnected else false,
+                isSubnetRoutingActive = if (wasRunning) _config.value.isSubnetRoutingActive else false,
+                tailnetIp = if (wasRunning) _config.value.tailnetIp else "0.0.0.0"
+            )
+
+            val logStateBaseDir = context?.filesDir?.absolutePath
+                ?: throw IllegalStateException("Android app files directory is unavailable for Tailscale state")
+            log("Starting or reusing the single native runtime; app-private state directory is available.")
+            val result = TailscaleBridgeJni.startTsnet(trimmedKey, nodeName, routes, logStateBaseDir)
+            if (result < 0) {
+                log("ERROR: native Tailscale startup failed, code=$result")
+                val stateAfterFailure = TailscaleBridgeJni.getBackendState()
+                _config.value = _config.value.copy(
+                    backendState = stateAfterFailure,
+                    isRuntimeStarted = stateAfterFailure != "STOPPED",
+                    isConnected = false,
+                    isSubnetRoutingActive = false,
+                    tailnetIp = "0.0.0.0"
+                )
+                return
+            }
+
+            val backendState = TailscaleBridgeJni.getBackendState()
+            val tailnetIp = TailscaleBridgeJni.getAssignedTailnetIp()
+            val hasTailnetIp = tailnetIp != "0.0.0.0" && tailnetIp.isNotBlank()
+            val connected = backendState == "Running" && hasTailnetIp
+            _config.value = _config.value.copy(
+                backendState = backendState,
+                isRuntimeStarted = true,
+                isConnected = connected,
+                tailnetIp = tailnetIp,
+                isSubnetRoutingActive = connected
+            )
+
+            log("Native start result=$result; LocalBackend state=$backendState; Tailnet IP assigned=$hasTailnetIp.")
+            if (!connected) {
+                log("Tailscale runtime exists but is not connected yet. USB/bridge state remains independent.")
+            } else {
+                log("Tailscale connected with assigned Tailnet IP: $tailnetIp")
+            }
+            startStateMonitor()
+        } catch (e: UnsatisfiedLinkError) {
+            log("JNI linkage error: ${e.message}")
+        } catch (e: Exception) {
+            log("Tailscale startup error: ${e.message}")
+        }
+    }
+
+    private fun startStateMonitor() {
+        stateMonitorJob?.cancel()
+        stateMonitorJob = monitorScope.launch {
+            var lastState = ""
+            while (isActive && TailscaleBridgeJni.isLibraryLoaded) {
+                val state = try {
+                    TailscaleBridgeJni.getBackendState()
+                } catch (e: Exception) {
+                    log("State monitor error: ${e.message}")
+                    break
+                }
+                if (state == "STOPPED") {
+                    _config.value = _config.value.copy(
+                        backendState = "STOPPED",
+                        isRuntimeStarted = false,
+                        isConnected = false,
+                        isSubnetRoutingActive = false,
+                        tailnetIp = "0.0.0.0"
+                    )
+                    log("Native Tailscale runtime stopped.")
+                    break
+                }
+
+                val ip = try {
+                    TailscaleBridgeJni.getAssignedTailnetIp()
+                } catch (_: Exception) {
+                    "0.0.0.0"
+                }
+                val hasIp = ip != "0.0.0.0" && ip.isNotBlank()
+                val connected = state == "Running" && hasIp
+                val old = _config.value
+                _config.value = old.copy(
+                    backendState = state,
+                    isRuntimeStarted = true,
+                    isConnected = connected,
+                    isSubnetRoutingActive = connected,
+                    tailnetIp = ip
+                )
+                if (state != lastState) {
+                    log("LocalBackend state: $state")
+                    lastState = state
+                }
+                if (connected && !old.isConnected) {
+                    log("Tailnet connection established; IP=$ip")
+                } else if (!connected && old.isConnected) {
+                    log("Tailnet connection is no longer active; backend state=$state")
+                }
+                delay(1000)
+            }
+        }
     }
 
     /**
@@ -139,17 +231,22 @@ class TailscaleSubnetManager(private val context: Context? = null) {
     }
 
     fun stopSubnetRouter() {
+        stateMonitorJob?.cancel()
+        stateMonitorJob = null
         if (TailscaleBridgeJni.isLibraryLoaded) {
             try {
-                TailscaleBridgeJni.stopTsnet()
+                val result = TailscaleBridgeJni.stopTsnet()
+                log("Explicit Tailscale runtime stop requested; native result=$result")
             } catch (e: Exception) {
                 log("Error stopping tsnet daemon: ${e.message}")
             }
         }
-        log("Embedded Tailscale userspace backend stopped.")
         _config.value = _config.value.copy(
             isConnected = false,
-            isSubnetRoutingActive = false
+            isSubnetRoutingActive = false,
+            isRuntimeStarted = false,
+            backendState = "STOPPED",
+            tailnetIp = "0.0.0.0"
         )
     }
 

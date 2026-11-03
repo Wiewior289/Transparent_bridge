@@ -130,3 +130,32 @@ Gate: raport throughput, RTT, loss, CPU, temperatury.
 ## Warunek ukończenia
 
 TRUE_BRIDGE nie oznacza tylko build-success, udanego CDC bind ani startu Go backendu. Wymaga poprawnego USB RX/TX, poprawnego NAT i rzeczywistego pakietu z tailnetu do PLC oraz odpowiedzi wracającej tym samym flow.
+
+## Embedded Tailscale backend lifecycle
+
+The production bridge uses the embedded Tailscale userspace engine:
+`wgengine.NewUserspaceEngine` + `ipnlocal.LocalBackend` + the custom
+`UserlandTun`. It is not based on the public `tsnet.Server` TCP/UDP API.
+
+The runtime must preserve these startup requirements:
+
+- Persistent node state is stored under the app-private files directory in
+  `tailscaled.state`; an in-memory store is not acceptable for normal restarts.
+- `TS_LOGS_DIR` points to an app-private writable directory, and the LocalBackend
+  variable root is set to the same app-private data directory.
+- Android's interface inventory is supplied to Tailscale netmon through the
+  registered JNI callback. The listener therefore exposes both
+  `onTailscalePacketReceived(byte[], int)` and
+  `getTailscaleInterfacesJson()`.
+- A non-empty auth key and a valid IPv4 advertised prefix are checked before
+  starting the backend. The key itself must never be written to logs.
+- Native start success means only that runtime startup was accepted. The Kotlin
+  manager polls `LocalBackend.State()`; the bridge is considered tailnet-ready
+  only when state is `Running` and a non-zero tailnet address is assigned.
+- The production service waits for that readiness state with a bounded timeout.
+  USB transport readiness and tailnet readiness remain separate states.
+
+A running LocalBackend does not prove that the advertised subnet has been
+approved in the Tailscale admin console or that ACL policy allows the traffic.
+Those remain external deployment checks. The final proof is still an end-to-end
+tailnet client -> PLC -> tailnet client test on hardware.

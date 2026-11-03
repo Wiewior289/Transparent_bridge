@@ -39,9 +39,14 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicLong
+import java.net.NetworkInterface
+import org.json.JSONArray
+import org.json.JSONObject
 
 class PlcBridgeService : Service() {
 
@@ -201,6 +206,45 @@ class PlcBridgeService : Service() {
         handleOutgoingIpPacketFromTun(packet, length)
     }
 
+    /** Android interface inventory supplied to Tailscale netmon on Android 11+. */
+    @Keep
+    fun getTailscaleInterfacesJson(): String {
+        return try {
+            val result = JSONArray()
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return result.toString()
+            while (interfaces.hasMoreElements()) {
+                val networkInterface = interfaces.nextElement()
+                val item = JSONObject()
+                item.put("name", networkInterface.name)
+                item.put("index", networkInterface.index)
+                item.put("mtu", runCatching { networkInterface.mtu }.getOrDefault(0))
+                item.put("up", runCatching { networkInterface.isUp }.getOrDefault(false))
+                item.put("broadcast", runCatching {
+                    networkInterface.interfaceAddresses.any { it.broadcast != null }
+                }.getOrDefault(false))
+                item.put("loopback", runCatching { networkInterface.isLoopback }.getOrDefault(false))
+                item.put("pointToPoint", runCatching { networkInterface.isPointToPoint }.getOrDefault(false))
+                item.put("multicast", runCatching { networkInterface.supportsMulticast() }.getOrDefault(false))
+
+                val addresses = JSONArray()
+                for (entry in networkInterface.interfaceAddresses) {
+                    val address = entry.address ?: continue
+                    val addr = JSONObject()
+                    addr.put("ip", address.hostAddress.substringBefore('%'))
+                    addr.put("prefixLen", entry.networkPrefixLength.toInt())
+                    addresses.put(addr)
+                }
+                item.put("addrs", addresses)
+                result.put(item)
+            }
+            Log.i(TAG, "Android netmon provider enumerated " + result.length() + " interfaces")
+            result.toString()
+        } catch (error: Exception) {
+            Log.e(TAG, "Android netmon interface enumeration failed", error)
+            "[]"
+        }
+    }
+
     @Synchronized
     fun startBridge(device: UsbDevice? = null) {
         if (_bridgeState.value == BridgeState.RUNNING ||
@@ -235,7 +279,10 @@ class PlcBridgeService : Service() {
 
                 if (TailscaleBridgeJni.isLibraryLoaded) {
                     val regRes = TailscaleBridgeJni.registerPacketListener(this@PlcBridgeService)
-                    Log.i(TAG, "Registered JNI packet listener (code $regRes)")
+                    if (regRes != 0) {
+                        throw IllegalStateException("Tailscale JNI listener registration failed: $regRes")
+                    }
+                    Log.i(TAG, "Registered JNI packet and Android netmon callbacks")
                 }
 
                 val config = tailscaleManager.config.value
@@ -251,9 +298,20 @@ class PlcBridgeService : Service() {
 
                 currentCoroutineContext().ensureActive()
 
-                if (!tailscaleManager.config.value.isSubnetRoutingActive) {
+                // LocalBackend.Start() is asynchronous with respect to tailnet login.
+                // Do not call the USB bridge RUNNING until Tailscale reports Running + a real IP.
+                val tailnetState = withTimeoutOrNull(45_000L) {
+                    tailscaleManager.config.first { state ->
+                        state.isConnected ||
+                            state.backendState == "NeedsLogin" ||
+                            state.backendState == "NeedsMachineAuth" ||
+                            state.backendState == "STOPPED"
+                    }
+                }
+                if (tailnetState?.isConnected != true) {
+                    val current = tailscaleManager.config.value
                     throw IllegalStateException(
-                        "Tailscale backend did not start successfully"
+                        "Tailscale is not ready: state=${current.backendState}, tailnetIp=${current.tailnetIp}"
                     )
                 }
 

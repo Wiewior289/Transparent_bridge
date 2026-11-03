@@ -28,4 +28,5 @@ object TailscaleBridgeJni {
     external fun stopTsnet(): Int
     external fun injectPacket(packet: ByteArray, length: Int): Int
     external fun getAssignedTailnetIp(): String
+    external fun getBackendState(): String
 }
