@@ -1,12 +1,8 @@
 pluginManagement {
   repositories {
-    google {
-      content {
-        includeGroupByRegex("com\\.android.*")
-        includeGroupByRegex("com\\.google.*")
-        includeGroupByRegex("androidx.*")
-      }
-    }
+    // AGP itself can pull non-Android runtime artifacts such as JAXB.
+    // Keep Google's Maven mirror available for those transitive plugin dependencies.
+    google()
     mavenCentral()
     gradlePluginPortal()
   }
