@@ -29,4 +29,5 @@ object TailscaleBridgeJni {
     external fun injectPacket(packet: ByteArray, length: Int): Int
     external fun getAssignedTailnetIp(): String
     external fun getBackendState(): String
+    external fun getPacketFlowStats(): String
 }

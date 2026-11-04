@@ -103,6 +103,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 	"strings"
@@ -177,11 +178,13 @@ type packetRequest struct {
 }
 
 type UserlandTun struct {
-	events    chan tun.Event
-	closed    chan struct{}
-	ctx       context.Context
-	incoming  chan packetRequest
-	closeOnce sync.Once
+	events          chan tun.Event
+	closed          chan struct{}
+	ctx             context.Context
+	incoming        chan packetRequest
+	closeOnce       sync.Once
+	jniInjectQueued atomic.Uint64
+	tunReadConsumed atomic.Uint64
 }
 
 func NewUserlandTun(ctx context.Context) *UserlandTun {
@@ -243,9 +246,13 @@ func (t *UserlandTun) Read(buffs [][]byte, sizes []int, offset int) (int, error)
 				sizes[packetsRead] = nNext
 				packetsRead++
 			default:
+				// Count packets only when Read hands the batch back to wgengine.
+				t.tunReadConsumed.Add(uint64(packetsRead))
 				return packetsRead, nil
 			}
 		}
+		// Read successfully consumed the complete batch for wgengine.
+		t.tunReadConsumed.Add(uint64(packetsRead))
 		return packetsRead, nil
 	}
 }
@@ -462,10 +469,32 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_injectPacket(env *C.JNIEnv, th
 
 	select {
 	case bridge.tun.incoming <- packetRequest{data: goBytes}:
+		bridge.tun.jniInjectQueued.Add(1)
 		return C.jint(length)
 	default:
 		return 0
 	}
+}
+
+//export Java_com_example_core_vpn_TailscaleBridgeJni_getPacketFlowStats
+func Java_com_example_core_vpn_TailscaleBridgeJni_getPacketFlowStats(env *C.JNIEnv, thiz C.jobject) C.jstring {
+	stats := "nativeState=STOPPED jniInjectQueued=0 tunReadConsumed=0 queue=0/0"
+
+	globalMu.RLock()
+	if bridge := globalBridge; bridge != nil && bridge.running {
+		stats = fmt.Sprintf(
+			"nativeState=RUNNING jniInjectQueued=%d tunReadConsumed=%d queue=%d/%d",
+			bridge.tun.jniInjectQueued.Load(),
+			bridge.tun.tunReadConsumed.Load(),
+			len(bridge.tun.incoming),
+			cap(bridge.tun.incoming),
+		)
+	}
+	globalMu.RUnlock()
+
+	cStats := C.CString(stats)
+	defer C.free(unsafe.Pointer(cStats))
+	return C.jstring(C.cgoNewStringUTF(env, cStats))
 }
 
 //export Java_com_example_core_vpn_TailscaleBridgeJni_stopTsnet

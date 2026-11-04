@@ -230,6 +230,16 @@ class TailscaleSubnetManager(private val context: Context? = null) {
         }
     }
 
+    /** Native queue/read counters for the USB -> Tailscale return path. */
+    fun getPacketFlowStats(): String {
+        if (!TailscaleBridgeJni.isLibraryLoaded) return "nativeState=UNAVAILABLE"
+        return try {
+            TailscaleBridgeJni.getPacketFlowStats()
+        } catch (error: Throwable) {
+            "nativeState=ERROR detail=${error.message ?: error.javaClass.simpleName}"
+        }
+    }
+
     fun stopSubnetRouter() {
         stateMonitorJob?.cancel()
         stateMonitorJob = null

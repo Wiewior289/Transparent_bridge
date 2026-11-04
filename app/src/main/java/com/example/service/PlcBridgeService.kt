@@ -104,6 +104,9 @@ class PlcBridgeService : Service() {
     val totalTxPackets = AtomicLong(0L)
     val totalDroppedPackets = AtomicLong(0L)
 
+    // Incremented only after a PLC reply has passed exact reverse-NAT matching.
+    private val reverseNatAcceptedPackets = AtomicLong(0L)
+
     private var rxJob: Job? = null
     private var statsJob: Job? = null
 
@@ -255,6 +258,7 @@ class PlcBridgeService : Service() {
         }
 
         _bridgeState.value = BridgeState.STARTING
+        reverseNatAcceptedPackets.set(0L)
 
         startJob = serviceScope.launch {
             try {
@@ -501,6 +505,9 @@ class PlcBridgeService : Service() {
                     return
                 }
 
+                // This counter marks successful reverse-NAT matching, before JNI enqueue.
+                reverseNatAcceptedPackets.incrementAndGet()
+
                 val restoredDst = ArpEngine.formatIp(ipPacket, 16)
                 val protoNum = ipPacket[9].toInt() and 0xFF
                 val protoStr = when (protoNum) {
@@ -525,8 +532,18 @@ class PlcBridgeService : Service() {
     private fun startStatsLoop() {
         statsJob?.cancel()
         statsJob = serviceScope.launch {
+            var lastPacketFlowSnapshot = ""
             while (isActive) {
                 delay(1000)
+
+                val packetFlowSnapshot =
+                    "reverseNatAccepted=${reverseNatAcceptedPackets.get()} " +
+                    tailscaleManager.getPacketFlowStats()
+                if (packetFlowSnapshot != lastPacketFlowSnapshot) {
+                    Log.i(TAG, "PACKET_FLOW $packetFlowSnapshot")
+                    lastPacketFlowSnapshot = packetFlowSnapshot
+                }
+
                 val rx = totalRxBytes.get()
                 val tx = totalTxBytes.get()
                 val rxPackets = totalRxPackets.get()
