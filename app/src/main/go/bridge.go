@@ -382,6 +382,23 @@ func Java_com_example_core_vpn_TailscaleBridgeJni_startTsnet(env *C.JNIEnv, thiz
 	bridgeLogf("startup: NewUserspaceEngine success")
 	sys.Set(eng)
 
+	// tstun.Wrapper starts its vector poller during NewUserspaceEngine,
+	// but its Read path remains blocked until Wrapper.Start closes startCh.
+	// The tsnet embedding explicitly starts this wrapper after creating the
+	// netstack. This bridge has no netstack.Create step, so start it here
+	// before LocalBackend.Start and before any packets can be injected.
+	tunWrap, ok := sys.Tun.GetOK()
+	if !ok {
+		bridgeLogf("startup: tstun Wrapper missing; cannot start packet datapath")
+		eng.Close()
+		dialer.Close()
+		uTun.Close()
+		cancel()
+		return -2
+	}
+	tunWrap.Start()
+	bridgeLogf("startup: tstun Wrapper.Start completed; packet datapath unblocked")
+
 	bridgeLogf("startup: NewLocalBackend begin")
 	lb, err := ipnlocal.NewLocalBackend(
 		bridgeLogf,
